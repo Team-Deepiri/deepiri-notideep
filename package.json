@@ -1,0 +1,21 @@
+{
+  "name": "notideep-discord-bot",
+  "version": "1.0.0",
+  "description": "Discord bot for creating notification embeds with buttons",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node index.js"
+  },
+  "keywords": [
+    "discord",
+    "bot",
+    "notifications"
+  ],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "discord.js": "^14.14.1"
+  }
+}
+
