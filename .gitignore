@@ -80,3 +80,5 @@ logs/
 *.seed
 *.pid.lock
 *.pem
+
+*.claude

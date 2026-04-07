@@ -13,6 +13,7 @@ from discord.ext import commands
 from dotenv import load_dotenv
 
 from github import invite_user
+from meetings import setup_meeting_features
 from onboarding import ApprovalView
 from plaky import create_task, get_tasks
 
@@ -41,6 +42,7 @@ PR_CHANNEL_ID = _int_env("PR_CHANNEL_ID")
 QA_CHANNEL_ID = _int_env("QA_CHANNEL_ID")
 SERVER_COM_CHANNEL_ID = _int_env("SERVER_COM_CHANNEL_ID")
 DEV_TEAM_ROLE_ID = _int_env("DEV_TEAM_ROLE_ID")
+STAFF_ROLE_ID = _int_env("STAFF_ROLE_ID")
 
 WEBHOOK_HOST = os.getenv("WEBHOOK_HOST", "0.0.0.0")
 WEBHOOK_PORT = int(os.getenv("WEBHOOK_PORT", "8080"))
@@ -99,6 +101,7 @@ class DeepiriBot(commands.Bot):
 
 
 bot = DeepiriBot()
+meeting_service = setup_meeting_features(bot)
 
 
 def _extract_github_profile_username(message_content: str) -> Optional[str]:
@@ -161,9 +164,22 @@ async def _channel_from_id(channel_id: Optional[int]) -> Optional[discord.TextCh
     return None
 
 
+def _is_staff(member: discord.Member) -> bool:
+    if STAFF_ROLE_ID is None:
+        return member.guild_permissions.administrator
+    return member.get_role(STAFF_ROLE_ID) is not None or member.guild_permissions.administrator
+
+
+def _poll_option_emoji(index: int) -> str:
+    emojis = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣"]
+    return emojis[index] if index < len(emojis) else str(index + 1)
+
+
 @bot.event
 async def on_ready() -> None:
     print(f"Logged in as {bot.user} (id={bot.user.id if bot.user else 'unknown'})")
+
+    meeting_service.start_loop()
 
     if bot.webhook_runner is None:
         await start_webhook_server()
@@ -319,6 +335,51 @@ async def plaky_status(interaction: discord.Interaction) -> None:
 
     await qa_channel.send("\n".join(lines))
     await interaction.response.send_message("Posted status to QA channel.", ephemeral=True)
+
+
+@bot.tree.command(name="poll", description="Create a poll (staff only)")
+@app_commands.describe(question="The poll question", options="Comma-separated options (e.g., Yes, No, Maybe)")
+async def poll(interaction: discord.Interaction, question: str, options: str) -> None:
+    if not interaction.guild or not interaction.user:
+        await interaction.response.send_message("This command must be used in a server.", ephemeral=True)
+        return
+
+    if not isinstance(interaction.user, discord.Member):
+        await interaction.response.send_message("Could not verify your permissions.", ephemeral=True)
+        return
+
+    if not _is_staff(interaction.user):
+        await interaction.response.send_message("You do not have permission to use this command.", ephemeral=True)
+        return
+
+    option_list = [opt.strip() for opt in options.split(",") if opt.strip()]
+    if len(option_list) < 2:
+        await interaction.response.send_message("Please provide at least 2 options separated by commas.", ephemeral=True)
+        return
+
+    if len(option_list) > 9:
+        await interaction.response.send_message("Maximum 9 options allowed.", ephemeral=True)
+        return
+
+    embed = discord.Embed(
+        title=f"📊 {question}",
+        color=discord.Color.blue(),
+    )
+    embed.set_footer(text=f"Poll created by {interaction.user.display_name}")
+
+    for i, option in enumerate(option_list):
+        embed.add_field(name=f"{_poll_option_emoji(i)} {option}", value="\u200b", inline=True)
+
+    channel = interaction.channel
+    if not channel or not isinstance(channel, discord.TextChannel):
+        await interaction.response.send_message("This command can only be used in a text channel.", ephemeral=True)
+        return
+
+    await interaction.response.send_message("Poll created!", ephemeral=True)
+    poll_message = await channel.send(embed=embed)
+
+    for i in range(len(option_list)):
+        await poll_message.add_reaction(_poll_option_emoji(i))
 
 
 async def plaky_webhook_handler(request: web.Request) -> web.Response:
