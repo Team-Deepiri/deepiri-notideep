@@ -1,6 +1,7 @@
 import hashlib
 import hmac
 import json
+import logging
 import os
 import re
 from urllib.parse import urlparse
@@ -19,6 +20,12 @@ from plaky import create_task, get_tasks
 
 
 load_dotenv()
+
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+logger = logging.getLogger("deepiri.main")
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 GITHUB_PAT = os.getenv("GITHUB_PAT")
@@ -231,10 +238,25 @@ async def on_message(message: discord.Message) -> None:
 
     github_username = _extract_github_profile_username(content)
     if github_username:
+        logger.info(
+            "Auto-invite trigger: message_id=%s channel_id=%s author=%s parsed_username=%s",
+            message.id,
+            message.channel.id,
+            message.author,
+            github_username,
+        )
         result = invite_user(
             username=github_username,
             github_org=GITHUB_ORG or "",
             github_pat=GITHUB_PAT or "",
+        )
+
+        logger.info(
+            "Auto-invite result: username=%s ok=%s status=%s message=%s",
+            github_username,
+            result.get("ok"),
+            result.get("status"),
+            result.get("message"),
         )
 
         if result.get("ok"):

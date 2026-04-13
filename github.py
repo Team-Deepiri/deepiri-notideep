@@ -1,10 +1,21 @@
 import time
+from urllib.parse import urlparse
 from typing import Any, Dict, Optional
 
 import requests
 
 
 GITHUB_API_BASE = "https://api.github.com"
+
+
+def _normalize_org_name(github_org: str) -> str:
+    org = (github_org or "").strip()
+    if not org:
+        return ""
+    if org.startswith("http://") or org.startswith("https://"):
+        parsed = urlparse(org)
+        return parsed.path.strip("/").split("/")[0] if parsed.path else ""
+    return org.strip("/")
 
 
 def _request_with_rate_limit_retry(method: str, url: str, headers: Dict[str, str], json: Optional[Dict[str, Any]] = None, retries: int = 2) -> requests.Response:
@@ -47,7 +58,8 @@ def _get_user_id(username: str, github_pat: str) -> Dict[str, Any]:
 
 def invite_user(username: str, github_org: str, github_pat: str) -> Dict[str, Any]:
     """Invite a GitHub user to the configured org by username."""
-    if not github_pat or not github_org:
+    normalized_org = _normalize_org_name(github_org)
+    if not github_pat or not normalized_org:
         return {
             "ok": False,
             "status": 400,
@@ -71,7 +83,7 @@ def invite_user(username: str, github_org: str, github_pat: str) -> Dict[str, An
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
     }
-    url = f"{GITHUB_API_BASE}/orgs/{github_org}/invitations"
+    url = f"{GITHUB_API_BASE}/orgs/{normalized_org}/invitations"
     body = {"invitee_id": invitee_id}
 
     response = _request_with_rate_limit_retry("POST", url, headers=headers, json=body)

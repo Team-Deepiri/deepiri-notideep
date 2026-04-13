@@ -9,3 +9,15 @@ services:
       - .env
     environment:
       - LOG_LEVEL=INFO
+
+  discord-auto-invite-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: deepiri-auto-invite-bot
+    restart: "no"
+    env_file:
+      - .env
+    environment:
+      - LOG_LEVEL=INFO
+    command: ["python", "main.py"]
