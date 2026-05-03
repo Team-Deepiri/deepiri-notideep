@@ -1,4 +1,4 @@
-# Discord to GitHub Discussions Bridge
+# Deepiri Discord Bot
 
 Bridges messages from a Discord announcements channel into GitHub Discussions.
 
