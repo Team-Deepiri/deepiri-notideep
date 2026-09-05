@@ -47,6 +47,8 @@ GITHUB_SUPPORT_TEAM_SLUG = os.getenv("GITHUB_SUPPORT_TEAM_SLUG", "support-team")
 GITHUB_IT_TEAM_SLUG = os.getenv("GITHUB_IT_TEAM_SLUG", "it-management-team")
 PLAKY_API_KEY = os.getenv("PLAKY_API_KEY")
 PLAKY_WEBHOOK_SECRET = os.getenv("PLAKY_WEBHOOK_SECRET", "")
+PLAKY_BRIDGE_URL = os.getenv("PLAKY_BRIDGE_URL", "http://plaky-bridge:5009")
+INTERNAL_SERVICE_SECRET = os.getenv("INTERNAL_SERVICE_SECRET", "")
 DISCORD_PROXY_URL = (os.getenv("DISCORD_PROXY_URL") or "").strip() or None
 
 
@@ -216,6 +218,134 @@ GITHUB_RESERVED_PATHS = {
     "topics",
     "trending",
 }
+
+USER_DATA_PATH = Path("user_data.json")
+pending_email_requests = {}  # user_id -> True (we only track pending state)
+
+
+def _load_user_data() -> dict:
+    try:
+        if not USER_DATA_PATH.exists():
+            return {}
+        raw = USER_DATA_PATH.read_text(encoding="utf-8").strip() or "{}"
+        data = json.loads(raw)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        logger.exception("Failed to load user data")
+        return {}
+
+
+def _save_user_data(data: dict) -> None:
+    try:
+        USER_DATA_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = USER_DATA_PATH.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        tmp.replace(USER_DATA_PATH)
+    except Exception:
+        logger.exception("Failed to save user data")
+
+
+def _remember_user_data(discord_id: int, github_username: str = None, email: str = None) -> None:
+    data = _load_user_data()
+    key = str(discord_id)
+    if key not in data:
+        data[key] = {}
+    if github_username:
+        data[key]["github"] = github_username.lower()
+    if email:
+        data[key]["email"] = email.lower().strip()
+    _save_user_data(data)
+
+
+def _get_user_data(discord_id: int) -> dict:
+    data = _load_user_data()
+    return data.get(str(discord_id), {})
+
+
+def _is_valid_email(email: str) -> bool:
+    pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    return bool(re.match(pattern, email.strip()))
+
+
+async def _call_plaky_bridge_invite(email: str, role: str = "MEMBER") -> dict:
+    if not INTERNAL_SERVICE_SECRET:
+        logger.error("INTERNAL_SERVICE_SECRET not set, cannot call bridge")
+        return {"success": False, "error": "Bridge secret not configured"}
+    url = f"{PLAKY_BRIDGE_URL}/plaky/invite"
+    headers = {
+        "Content-Type": "application/json",
+        "X-Internal-Secret": INTERNAL_SERVICE_SECRET,
+    }
+    payload = {"email": email, "role": role}
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(url, json=payload, headers=headers)
+            resp.raise_for_status()
+            return resp.json()
+    except Exception as e:
+        logger.exception("Bridge invite failed")
+        return {"success": False, "error": str(e)}
+
+
+async def _call_plaky_bridge_kick(email: str) -> dict:
+    if not INTERNAL_SERVICE_SECRET:
+        logger.error("INTERNAL_SERVICE_SECRET not set, cannot call bridge")
+        return {"success": False, "error": "Bridge secret not configured"}
+    url = f"{PLAKY_BRIDGE_URL}/plaky/kick"
+    headers = {
+        "Content-Type": "application/json",
+        "X-Internal-Secret": INTERNAL_SERVICE_SECRET,
+    }
+    payload = {"email": email}
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(url, json=payload, headers=headers)
+            resp.raise_for_status()
+            return resp.json()
+    except Exception as e:
+        logger.exception("Bridge kick failed")
+        return {"success": False, "error": str(e)}
+
+
+async def _resolve_member_email_for_plaky(member: discord.Member, github_username: Optional[str] = None) -> Optional[str]:
+    """Best-effort resolution of a member's Plaky email, used before a Plaky
+    kick/invite. Tries, in order of trust:
+      1. user_data (email collected during onboarding / /github-invite-request)
+      2. member_emails store on platform Postgres (self-reported at join)
+      3. GitHub public profile email (via the resolved GitHub username)
+      4. Plaky fuzzy match across GitHub real name/login + Discord names
+    Returns None rather than guessing when nothing confident is found."""
+    if not isinstance(member, discord.Member):
+        return None
+
+    user_data = _get_user_data(member.id)
+    if user_data.get("email"):
+        return user_data["email"]
+
+    email = await load_member_email(member.id)
+    if email:
+        return email
+
+    github_real_name = None
+    if github_username:
+        profile = await asyncio.to_thread(get_user_profile, github_username, GITHUB_PAT) if GITHUB_PAT else {}
+        email = profile.get("email")
+        github_real_name = profile.get("name")
+        if email:
+            return email
+
+    if not PLAKY_API_KEY:
+        return None
+    candidates = [
+        github_real_name,
+        github_username,
+        member.display_name,
+        str(getattr(member, "global_name", "") or ""),
+        str(member.name),
+    ]
+    if not any(c for c in candidates if c):
+        return None
+    return await asyncio.to_thread(find_user_email, [c for c in candidates if c], PLAKY_API_KEY)
 
 
 def _discord_proxy_kwargs() -> dict:
@@ -510,35 +640,20 @@ def _is_valid_announcement_signature(raw_body: bytes, signature_header: str, sec
 
 
 def _load_github_username_map() -> dict:
-    try:
-        if not GITHUB_USERNAME_MAP_PATH.exists():
-            return {}
-        raw = GITHUB_USERNAME_MAP_PATH.read_text(encoding="utf-8").strip() or "{}"
-        data = json.loads(raw)
-        if isinstance(data, dict):
-            return {str(k): str(v).lower() for k, v in data.items() if isinstance(v, str)}
-        return {}
-    except Exception:
-        logger.exception("Failed to load GitHub username map from %s", GITHUB_USERNAME_MAP_PATH)
-        return {}
+    """Legacy wrapper — reads from user_data.json for backward compatibility."""
+    data = _load_user_data()
+    return {k: v.get("github", "") for k, v in data.items() if v.get("github")}
 
 
 def _save_github_username_map(mapping: dict) -> None:
-    try:
-        GITHUB_USERNAME_MAP_PATH.parent.mkdir(parents=True, exist_ok=True)
-        temporary_path = GITHUB_USERNAME_MAP_PATH.with_suffix(f"{GITHUB_USERNAME_MAP_PATH.suffix}.tmp")
-        temporary_path.write_text(json.dumps(mapping, indent=2), encoding="utf-8")
-        temporary_path.replace(GITHUB_USERNAME_MAP_PATH)
-    except Exception:
-        logger.exception("Failed to persist github username map")
+    """Legacy wrapper — no-op; prefer _remember_user_data."""
+    pass
 
 
 def _remember_github_username(discord_id: int, github_username: str) -> None:
     if not discord_id or not github_username:
         return
-    mapping = _load_github_username_map()
-    mapping[str(discord_id)] = github_username.lower()
-    _save_github_username_map(mapping)
+    _remember_user_data(discord_id, github_username=github_username)
 
 
 def _get_github_username_for_member(member: discord.Member) -> Optional[str]:
@@ -547,14 +662,13 @@ def _get_github_username_for_member(member: discord.Member) -> Optional[str]:
     The name fallback is not authoritative. Critical operations should first collect
     an explicit mapping through ``/github-invite-request``.
     """
-    mapping = _load_github_username_map()
-    gh = mapping.get(str(member.id))
-    if gh:
-        return gh
+    data = _load_user_data()
+    entry = data.get(str(member.id))
+    if entry and entry.get("github"):
+        return entry["github"]
     # Fallback: try display name or global name if it looks like a github username
     for candidate in [getattr(member, "global_name", None), getattr(member, "display_name", None), str(member.name) if hasattr(member, "name") else None]:
         if candidate and GITHUB_USERNAME_RE.match(candidate.strip()) and candidate.strip().lower() not in GITHUB_RESERVED_PATHS:
-            # Only use if single word
             if " " not in candidate.strip():
                 return candidate.strip().lower()
     return None
@@ -1183,7 +1297,7 @@ async def handle_github_invite_request(interaction: discord.Interaction, github_
 
     # Remember mapping for future role->team sync
     try:
-        _remember_github_username(interaction.user.id, normalized_username)
+        _remember_user_data(interaction.user.id, github_username=normalized_username)
     except Exception:
         logger.exception(
             "Failed to remember GitHub username %s for Discord user %s",
@@ -1329,7 +1443,21 @@ async def handle_offboard_user(interaction: discord.Interaction, member: discord
         if not team_result.get("ok"):
             logger.warning("GitHub team removal failed for %s: %s", normalized_username, team_result.get("message"))
 
-    await interaction.edit_original_response(content=f"Offboarding completed for {getattr(member, 'mention', normalized_username)}.")
+    # Kick out of Plaky too (best-effort, resolved via _resolve_member_email_for_plaky).
+    plaky_note = "no email on file, skipped"
+    if isinstance(member, discord.Member):
+        user_email = await _resolve_member_email_for_plaky(member, normalized_username)
+        if user_email:
+            plaky_result = await _call_plaky_bridge_kick(user_email)
+            if plaky_result.get("success"):
+                plaky_note = f"removed {user_email}"
+            else:
+                plaky_note = f"{user_email} — {plaky_result.get('error')}"
+                logger.warning("Plaky kick failed for %s during offboard: %s", user_email, plaky_result.get("error"))
+
+    await interaction.edit_original_response(
+        content=f"Offboarding completed for {getattr(member, 'mention', normalized_username)} ({plaky_note})."
+    )
 
 
 async def handle_discord_kick(interaction: discord.Interaction, member: discord.Member, reason: str | None = None) -> None:
@@ -1360,6 +1488,13 @@ async def handle_discord_kick(interaction: discord.Interaction, member: discord.
         logger.exception("Failed to kick member %s", member.id)
         await interaction.edit_original_response(content=f"Failed to kick {member.mention}.")
         return
+
+    # Also kick out of Plaky if we can resolve their email (best-effort).
+    user_email = await _resolve_member_email_for_plaky(member)
+    if user_email:
+        plaky_result = await _call_plaky_bridge_kick(user_email)
+        if not plaky_result.get("success"):
+            logger.warning("Plaky kick failed for %s via /discord-kick: %s", user_email, plaky_result.get("error"))
 
     await interaction.edit_original_response(content=f"Kicked {member.mention} from the server.")
     if STAFF_CHANNEL_ID:
@@ -1685,9 +1820,25 @@ async def _maybe_handle_kick_out_command(message: discord.Message) -> bool:
         if not github_ok:
             logger.warning("GitHub org removal failed for %s during kick-out: %s", github_username, org_result.get("message"))
 
+    # Kick out of Plaky too. Resolve the email via the same chain used by the
+    # termination notice (user_data -> member_emails -> GitHub -> Plaky), so a
+    # Plaky kick isn't skipped whenever the email wasn't collected at onboarding.
+    # Best-effort: a missing email shouldn't block the Discord/GitHub removal,
+    # just note it in the summary.
+    plaky_ok = False
+    plaky_note = "no email on file, skipped"
+    user_email = await _resolve_member_email_for_plaky(target, github_username)
+    if user_email:
+        plaky_result = await _call_plaky_bridge_kick(user_email)
+        plaky_ok = bool(plaky_result.get("success"))
+        plaky_note = user_email if plaky_ok else f"{user_email} — {plaky_result.get('error')}"
+        if not plaky_ok:
+            logger.warning("Plaky kick failed for %s during kick-out: %s", user_email, plaky_result.get("error"))
+
     summary = (
         f"{'✅' if discord_ok else '⚠️'} Discord kick: {target} ({target.id})\n"
         f"{'✅' if github_ok else '⚠️'} GitHub org removal: {github_note}\n"
+        f"{'✅' if plaky_ok else '⚠️'} Plaky removal: {plaky_note}\n"
         f"📧 Termination notice: {notice_outcome}"
     )
     summary_channel = await _resolve_reply_channel(message)
@@ -1777,14 +1928,21 @@ async def handle_ipca_signed(interaction: discord.Interaction, github_username: 
 
 def _register_slash_commands(target_bot: DeepiriBot) -> None:
     @target_bot.tree.command(name="github-invite-request", description="Request a GitHub invite after signing ICPA")
-    @app_commands.describe(github_username="Your GitHub profile username", team="Optional team to add the user to (support or it)")
+    @app_commands.describe(
+        github_username="Your GitHub profile username",
+        team="Optional team to add the user to (support or it)",
+    )
     @app_commands.choices(
         team=[
             app_commands.Choice(name="support", value="support"),
             app_commands.Choice(name="it", value="it"),
         ]
     )
-    async def github_invite_request(interaction: discord.Interaction, github_username: str, team: app_commands.Choice[str] | None = None) -> None:
+    async def github_invite_request(
+        interaction: discord.Interaction,
+        github_username: str,
+        team: app_commands.Choice[str] | None = None,
+    ) -> None:
         await handle_github_invite_request(interaction, github_username, team=team.value if team else None)
 
 
@@ -1925,6 +2083,19 @@ def _register_slash_commands(target_bot: DeepiriBot) -> None:
 
         for i in range(len(option_list)):
             await poll_message.add_reaction(_poll_option_emoji(i))
+
+    @target_bot.tree.command(name="plaky-invite", description="Invite a user to Plaky (staff only)")
+    @app_commands.describe(email="Email address to invite")
+    async def plaky_invite(interaction: discord.Interaction, email: str) -> None:
+        if not isinstance(interaction.user, discord.Member) or not _is_staff(interaction.user):
+            await interaction.response.send_message("Staff only command.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
+        result = await _call_plaky_bridge_invite(email)
+        if result.get("success"):
+            await interaction.followup.send(result.get("message", f"Invite sent to {email}"))
+        else:
+            await interaction.followup.send(f"Invite failed: {result.get('error', 'Unknown error')}")
 
 
 async def plaky_webhook_handler(request: web.Request) -> web.Response:
@@ -2368,6 +2539,19 @@ def _create_and_register_bot() -> DeepiriBot:
         if message.author.bot:
             return
         if message.guild is None:
+            if message.author.id in pending_email_requests:
+                email = message.content.strip()
+                if _is_valid_email(email):
+                    _remember_user_data(message.author.id, email=email)
+                    result = await _call_plaky_bridge_invite(email)
+                    if result.get("success"):
+                        await message.channel.send(f"Plaky invite sent to {email}")
+                    else:
+                        await message.channel.send(f"Plaky invite failed: {result.get('error')}")
+                    del pending_email_requests[message.author.id]
+                else:
+                    await message.channel.send("That doesn't look like a valid email. Please type a valid email (e.g., name@domain.com).")
+                return
             await _maybe_handle_onboarding_dm(message)
             await new_bot.process_commands(message)
             return
@@ -2376,7 +2560,28 @@ def _create_and_register_bot() -> DeepiriBot:
         if await _maybe_handle_kick_out_command(message):
             await new_bot.process_commands(message)
             return
-        await _maybe_auto_assign_ipca_roles(message)
+        roles_assigned = await _maybe_auto_assign_ipca_roles(message)
+
+        if roles_assigned and isinstance(message.author, discord.Member):
+            user_data = _get_user_data(message.author.id)
+            has_plaky_email = bool(user_data.get("email") or await load_member_email(message.author.id))
+            if not has_plaky_email:
+                try:
+                    await message.author.send(
+                        "Please provide your email address so we can send you a Plaky invite. "
+                        "Reply to this DM with your email (e.g., name@domain.com)."
+                    )
+                    pending_email_requests[message.author.id] = True
+                except discord.Forbidden:
+                    logger.warning("Cannot DM %s, they may have DMs disabled", message.author.id)
+            else:
+                email = await _resolve_member_email_for_plaky(message.author)
+                result = await _call_plaky_bridge_invite(email)
+                if result.get("success"):
+                    await message.channel.send(f"{message.author.mention} Plaky invite sent to {email}")
+                else:
+                    await message.channel.send(f"{message.author.mention} Plaky invite failed: {result.get('error')}")
+
         if _is_announcements_channel(message.channel):
             title = format_discussion_title(resolve_discord_mentions(message, message.content or ""))
             body = format_discussion_body(message)
