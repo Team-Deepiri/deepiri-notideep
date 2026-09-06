@@ -169,6 +169,13 @@ def _fetch_all_plaky_users(api_key: str) -> List[Dict[str, Any]]:
     return users
 
 
+def list_plaky_users(api_key: str) -> List[Dict[str, Any]]:
+    """Public wrapper over _fetch_all_plaky_users for callers (e.g. the
+    security-assessment module) that need the raw roster rather than an
+    identity-matched single user."""
+    return _fetch_all_plaky_users(api_key)
+
+
 def find_user_email(names: List[str], api_key: str, known_emails: Optional[List[str]] = None) -> Optional[str]:
     """Throw every known identifier signal at Plaky at once, rather than trying
     one candidate name and giving up: exact email match first (an email that's

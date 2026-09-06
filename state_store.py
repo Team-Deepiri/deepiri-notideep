@@ -68,6 +68,57 @@ async def load_last_online_at() -> Optional[datetime]:
         return None
 
 
+async def load_state(key: str) -> Optional[str]:
+    """Generic string read against the same key/value state route used for
+    the last-online checkpoint -- lets other one-off checkpoints (e.g. "date
+    the security-assessment digest last ran") reuse the same durable store
+    without needing a dedicated gateway route each time."""
+    url = _platform_state_url()
+    secret = _secret()
+    if not url or not secret:
+        return None
+    signature = hmac.new(secret.encode("utf-8"), GET_SIGNING_STRING, hashlib.sha256).hexdigest()
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.get(
+                url,
+                params={"key": key},
+                headers={"X-Norozo-Signature": f"sha256={signature}"},
+            )
+        if resp.status_code == 404:
+            return None
+        resp.raise_for_status()
+        return resp.json().get("value")
+    except Exception:
+        logger.exception("Failed to load state for key %s", key)
+        return None
+
+
+async def save_state(key: str, value: str) -> bool:
+    url = _platform_state_url()
+    secret = _secret()
+    if not url or not secret:
+        return False
+    body = {"key": key, "value": value}
+    raw = json.dumps(body).encode("utf-8")
+    signature = hmac.new(secret.encode("utf-8"), raw, hashlib.sha256).hexdigest()
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.post(
+                url,
+                content=raw,
+                headers={
+                    "Content-Type": "application/json",
+                    "X-Norozo-Signature": f"sha256={signature}",
+                },
+            )
+            resp.raise_for_status()
+        return True
+    except Exception:
+        logger.exception("Failed to save state for key %s", key)
+        return False
+
+
 async def save_last_online_at(when: Optional[datetime] = None) -> None:
     """Best-effort — a failed write just means the next restart's catch-up
     window is wider than ideal, not that anything is lost."""
