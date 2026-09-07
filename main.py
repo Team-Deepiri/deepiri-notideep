@@ -538,10 +538,38 @@ def _plaky_invite_status_text(status: str, email: Optional[str], sender_mention:
 
 
 async def _maybe_handle_plaky_pending_email_reply(message: discord.Message) -> bool:
-    """A ticket thread that was asked for an email (pending_plaky_ask) -- the
-    next message carrying an address completes the invite for the pending member."""
-    if message.guild is None or message.author.bot:
+    """Completes a pending email ask for a Plaky invite. Two shapes:
+
+    - A ticket thread that was asked in-thread for the invite address -- the
+      next message carrying one completes the invite for the pending member.
+    - A DM reply to the email ask Norozo sent after an IPCA sign (the DM is
+      framed purely as 'adding you to Plaky'; the captured address also goes on
+      file via the usual persistence chain -- nothing here ever mentions
+      offboarding).
+
+    Replays in whatever channel the ask was issued."""
+    if message.author.bot:
         return False
+    if message.guild is None:
+        if not isinstance(message.channel, discord.DMChannel):
+            return False
+        entry = await _pending_plaky_ask_pop(message.channel.id)
+        if entry is None or str(entry.get("discord_id") or "") != str(message.author.id):
+            return False
+        email = _email_from_text(message.content or "")
+        if not email:
+            # Still waiting on the address -- don't let another handler eat the reply.
+            await _pending_plaky_ask_set(message.channel.id, entry)
+            return True
+        status, used_email = await _invite_member_to_plaky(
+            discord_id=message.author.id,
+            discord_username=str(message.author),
+            github_username=entry.get("github_username"),
+            email=email,
+            role=entry.get("role") or "MEMBER",
+        )
+        await message.channel.send(_plaky_invite_status_text(status, used_email or email, ""))
+        return True
     if not isinstance(message.channel, discord.Thread):
         return False
     entry = await _pending_plaky_ask_pop(message.channel.id)
@@ -667,7 +695,13 @@ def _extract_add_target_name(content: str) -> Optional[str]:
 async def _maybe_auto_invite_to_plaky(message: discord.Message, member: discord.Member) -> None:
     """IPCA-sign side effect: once roles are granted, the same ticket message
     also kicks off the Plaky invite (email from the message, GitHub link if
-    present, then the resolution chain, then an in-thread ask)."""
+    present, then the resolution chain). If the email can't be resolved the
+    signer is DM'd straight away to send it -- phrased purely as setting up
+    their Plaky access -- and the pending ask is keyed off that DM. When the
+    member's DMs are closed (or the ask otherwise can't be DM'd) it falls back
+    to the in-thread ask. The address they reply with is recorded on file via
+    the usual persistence chain; nothing surfaces that the record also serves
+    future offboarding."""
     content = message.content or ""
     email = _email_from_text(content)
     github_username = None
@@ -689,6 +723,23 @@ async def _maybe_auto_invite_to_plaky(message: discord.Message, member: discord.
     )
     reply_channel = await _resolve_reply_channel(message)
     if status == "asked":
+        dm_ask = await _send_plaky_dm_email_ask(member)
+        if dm_ask is not None:
+            await _pending_plaky_ask_set(
+                dm_ask.channel.id,
+                {
+                    "discord_id": member.id,
+                    "github_username": github_username,
+                    "role": "MEMBER",
+                    "requested_at": time.time(),
+                    "sender_id": member.id,
+                    "via": "dm",
+                },
+            )
+            await reply_channel.send(
+                f"📩 Sent {member.mention} a DM for their email to set up the Plaky invite — no action needed from you."
+            )
+            return
         await _pending_plaky_ask_set(
             reply_channel.id if getattr(reply_channel, "id", None) else message.channel.id,
             {
@@ -697,9 +748,36 @@ async def _maybe_auto_invite_to_plaky(message: discord.Message, member: discord.
                 "role": "MEMBER",
                 "requested_at": time.time(),
                 "sender_id": member.id,
+                "via": "thread",
             },
         )
     await reply_channel.send(_plaky_invite_status_text(status, used_email or email, member.mention))
+
+
+def _plaky_dm_ask_text(member_name: str) -> str:
+    """DM copy for the IPCA-sign Plaky email ask. Deliberately only ever talks
+    about setting up Plaky access -- never about having the address on file for
+    future offboarding."""
+    return (
+        f"Hey {member_name}! I'm setting you up on the Deepiri Plaky workspace so "
+        "you can track your tickets alongside the team. Just reply here with the "
+        "email you'd like me to invite (e.g. `jane@deepiri.com`) and I'll sort the "
+        "invite out from there."
+    )
+
+
+async def _send_plaky_dm_email_ask(member: discord.Member):
+    """DM the IPCA signer asking for the Plaky-invite email, framed purely as
+    workspace setup. Returns the created DM message on success (the caller keys
+    the pending ask off its channel id), or None when the member can't be DM'd
+    and the ask has to fall back to the ticket thread."""
+    try:
+        return await member.send(_plaky_dm_ask_text(member.display_name or member.name or "there"))
+    except discord.Forbidden:
+        return None
+    except Exception:
+        logger.exception("Failed to DM %s the Plaky email ask", member.id)
+        return None
 
 
 async def _maybe_handle_plaky_kick_on_kickout(message: discord.Message, target: discord.Member) -> str:
@@ -3361,6 +3439,11 @@ def _create_and_register_bot() -> DeepiriBot:
         if message.author.bot:
             return
         if message.guild is None:
+            # A DM reply to the Plaky email ask sent after an IPCA sign outranks
+            # onboarding so the invite gets completed and confirmed in-DM.
+            if await _maybe_handle_plaky_pending_email_reply(message):
+                await new_bot.process_commands(message)
+                return
             await _maybe_handle_onboarding_dm(message)
             await new_bot.process_commands(message)
             return

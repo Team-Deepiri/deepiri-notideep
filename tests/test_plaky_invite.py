@@ -269,13 +269,106 @@ async def test_ipca_sign_triggers_plaky_invite_and_asks_without_email(monkeypatc
     monkeypatch.setattr(main, "resolve_member_email", AsyncMock(return_value=None))
     monkeypatch.setattr(main, "_resolve_reply_channel", AsyncMock(return_value=channel))
     monkeypatch.setattr(main, "_close_ticket_thread", AsyncMock())
+    dm_msg = SimpleNamespace(channel=SimpleNamespace(id=42))
+    member.send = AsyncMock(return_value=dm_msg)
 
     ipca_assigned = await main._maybe_auto_assign_ipca_roles(message)
     assert ipca_assigned is True
 
-    # Same message also triggers the Plaky auto-invite; no email known -> in-thread ask.
+    # IPCA sign, no email known -> DM the signer (not an in-thread ask).
     await main._maybe_auto_invite_to_plaky(message, member)
 
-    assert main.PENDING_PLAKY_EMAIL_THREADS.get(710, {}).get("discord_id") == 42
+    member.send.assert_awaited_once()
+    assert main.PENDING_PLAKY_EMAIL_THREADS.get(42, {}).get("discord_id") == 42
+    assert main.PENDING_PLAKY_EMAIL_THREADS.get(42, {}).get("via") == "dm"
+    # The DM ask never hints the address is also kept on file for offboarding.
+    dm_copy = member.send.await_args.args[0]
+    assert "plaky" in dm_copy.lower()
+    assert "kick" not in dm_copy.lower()
+    assert "offboard" not in dm_copy.lower()
+    # Thread only gets a short handled-note, not the in-thread "reply here" ask.
+    thread_copy = " ".join(str(c.args) for c in channel.send.call_args_list)
+    assert "DM" in thread_copy
+
+
+@pytest.mark.asyncio
+async def test_ipca_sign_falls_back_to_thread_ask_when_dms_closed(monkeypatch):
+    member = _member(discord_id=42, name="jane")
+    channel = _ticket_channel(thread_id=711)
+    message = _ticket_message(member, channel, "I signed the IPCA")
+    monkeypatch.setattr(main, "SUPPORT_SESSIONS_CHANNEL_ID", 100)
+    monkeypatch.setattr(main, "GITHUB_PROFILES_CHANNEL_ID", None)
+    monkeypatch.setattr(main, "PLAKY_API_KEY", None)
+    monkeypatch.setattr(main, "call_plaky_bridge_invite", AsyncMock())
+    monkeypatch.setattr(main, "resolve_member_email", AsyncMock(return_value=None))
+    monkeypatch.setattr(main, "_resolve_reply_channel", AsyncMock(return_value=channel))
+    monkeypatch.setattr(main, "_send_plaky_dm_email_ask", AsyncMock(return_value=None))
+
+    await main._maybe_auto_invite_to_plaky(message, member)
+
+    assert main.PENDING_PLAKY_EMAIL_THREADS.get(711, {}).get("via") == "thread"
     joined = " ".join(str(c.args) for c in channel.send.call_args_list)
-    assert "email" in joined.lower()
+    assert "reply in this thread" in joined.lower()
+
+
+@pytest.mark.asyncio
+async def test_dm_pending_email_reply_completes_invite(monkeypatch):
+    discord = __import__("discord")
+    member = _member(discord_id=42, name="jane")
+    dm_channel = Mock(spec=discord.DMChannel)
+    dm_channel.id = 42
+    dm_channel.send = AsyncMock()
+    message = SimpleNamespace(
+        id=998,
+        guild=None,
+        channel=dm_channel,
+        thread=None,
+        content="jane@deepiri.com",
+        author=member,
+        mentions=[],
+    )
+    monkeypatch.setattr(main, "PLAKY_API_KEY", "pk")
+    bridge_invite = AsyncMock(return_value={"success": True, "via": "cake"})
+    monkeypatch.setattr(main, "call_plaky_bridge_invite", bridge_invite)
+    await main._pending_plaky_ask_set(
+        42,
+        {"discord_id": 42, "github_username": None, "role": "MEMBER", "requested_at": __import__("time").time(), "sender_id": 42, "via": "dm"},
+    )
+
+    handled = await main._maybe_handle_plaky_pending_email_reply(message)
+
+    assert handled is True
+    assert 42 not in main.PENDING_PLAKY_EMAIL_THREADS
+    bridge_invite.assert_awaited_once_with("jane@deepiri.com", role="MEMBER")
+    dm_channel.send.assert_awaited_once()
+    dm_reply = dm_channel.send.await_args.args[0]
+    assert "invite" in dm_reply.lower()
+    assert "kick" not in dm_reply.lower()
+
+
+@pytest.mark.asyncio
+async def test_dm_pending_email_reply_ignored_for_other_member(monkeypatch):
+    discord = __import__("discord")
+    other = _member(discord_id=77, name="claire")
+    dm_channel = Mock(spec=discord.DMChannel)
+    dm_channel.id = 77
+    dm_channel.send = AsyncMock()
+    message = SimpleNamespace(
+        id=999,
+        guild=None,
+        channel=dm_channel,
+        thread=None,
+        content="claire@deepiri.com",
+        author=other,
+        mentions=[],
+    )
+    monkeypatch.setattr(main, "PLAKY_API_KEY", "pk")
+    await main._pending_plaky_ask_set(
+        42,
+        {"discord_id": 42, "github_username": None, "role": "MEMBER", "requested_at": __import__("time").time(), "sender_id": 42, "via": "dm"},
+    )
+
+    handled = await main._maybe_handle_plaky_pending_email_reply(message)
+
+    assert handled is False
+    assert 42 in main.PENDING_PLAKY_EMAIL_THREADS
