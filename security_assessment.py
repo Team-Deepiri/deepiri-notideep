@@ -208,6 +208,11 @@ def check_website_security(url: str, *, cert_warn_days: int = 21) -> Dict[str, A
 
     try:
         ctx = ssl.create_default_context()
+        # create_default_context() alone still permits negotiating down to TLSv1/1.1 on
+        # some OpenSSL builds -- pin the floor explicitly rather than relying on the
+        # implicit default (this is itself a routine security check; it shouldn't be
+        # the thing doing an insecure handshake).
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
         with socket.create_connection((host, 443), timeout=10) as sock:
             with ctx.wrap_socket(sock, server_hostname=host) as tls_sock:
                 cert = tls_sock.getpeercert()
