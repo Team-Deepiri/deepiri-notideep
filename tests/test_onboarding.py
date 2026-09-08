@@ -456,7 +456,11 @@ async def test_handle_offboard_user_removes_roles_and_github_memberships(monkeyp
         github_pat="token",
         team_slug="support-team",
     )
-    interaction.edit_original_response.assert_awaited_once_with(content="Offboarding completed for @test-user.")
+    # Also best-effort kicks the user from Plaky; this member has no resolvable
+    # email, so that step is skipped and reported as such rather than failing.
+    interaction.edit_original_response.assert_awaited_once_with(
+        content="Offboarding completed for @test-user (no email on file, skipped)."
+    )
 
 
 @pytest.mark.asyncio
