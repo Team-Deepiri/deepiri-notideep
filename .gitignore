@@ -84,4 +84,4 @@ meetings.json
 *.pid.lock
 *.pem
 
-*.claude
+*.claudeuser_data.json
