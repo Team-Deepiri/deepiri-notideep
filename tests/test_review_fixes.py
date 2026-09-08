@@ -213,23 +213,25 @@ def test_create_and_register_bot_registers_all_global_slash_commands(monkeypatch
 
 
 def test_github_username_map_load_failure_is_logged(monkeypatch, tmp_path, caplog):
-    invalid_map = tmp_path / "github-usernames.json"
-    invalid_map.write_text("not-json", encoding="utf-8")
-    monkeypatch.setattr(main, "GITHUB_USERNAME_MAP_PATH", invalid_map)
+    """_load_github_username_map is now a legacy wrapper reading unified
+    user_data.json (USER_DATA_PATH), not its own github-usernames.json file."""
+    invalid_data = tmp_path / "user_data.json"
+    invalid_data.write_text("not-json", encoding="utf-8")
+    monkeypatch.setattr(main, "USER_DATA_PATH", invalid_data)
 
     with caplog.at_level("ERROR"):
         assert main._load_github_username_map() == {}
 
-    assert "Failed to load GitHub username map" in caplog.text
+    assert "Failed to load user data" in caplog.text
 
 
 def test_explicit_github_username_mapping_precedes_name_inference(monkeypatch, tmp_path):
-    username_map = tmp_path / "github-usernames.json"
-    username_map.write_text('{"42": "ExplicitUser"}', encoding="utf-8")
-    monkeypatch.setattr(main, "GITHUB_USERNAME_MAP_PATH", username_map)
+    user_data = tmp_path / "user_data.json"
+    user_data.write_text('{"42": {"github": "ExplicitUser"}}', encoding="utf-8")
+    monkeypatch.setattr(main, "USER_DATA_PATH", user_data)
     member = SimpleNamespace(id=42, global_name="inferred-user", display_name="inferred-user", name="inferred-user")
 
-    assert main._get_github_username_for_member(member) == "explicituser"
+    assert main._get_github_username_for_member(member) == "ExplicitUser"
 
 
 def test_meeting_role_ids_take_precedence_over_role_name_fallback(monkeypatch, tmp_path):
