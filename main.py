@@ -26,9 +26,18 @@ from identity_match import best_match
 from github_discussion import GitHubDiscussionError, create_github_discussion
 from meetings import setup_meeting_features
 from onboarding import ApprovalView
-from member_email_store import load_member_email, load_member_profile, save_member_email, save_member_real_name
+from member_email_store import load_member_profile, save_member_email, save_member_real_name
 from pr_staleness_store import claim_pr_staleness_1month, find_discord_id_by_email, load_pr_staleness, save_pr_staleness
 from plaky import create_task, find_user_email, get_tasks
+from plaky_invite import (
+    call_plaky_bridge_invite,
+    call_plaky_bridge_kick,
+    get_user_data,
+    is_valid_email,
+    persist_member_email,
+    remember_user_data,
+    resolve_member_email,
+)
 from security_assessment import overall_status, render_digest_lines, render_indepth_report, run_full_assessment
 from state_store import load_last_online_at, load_state, save_last_online_at, save_state
 
@@ -175,6 +184,39 @@ PLAKY_URL_RE = re.compile(r"https?://(?:www\.)?app\.plaky\.com/\S+", re.IGNORECA
 GITHUB_USERNAME_RE = re.compile(r"^[A-Za-z\d](?:[A-Za-z\d-]{0,37}[A-Za-z\d])?$")
 EMAIL_SEARCH_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
 
+# "Add me / add someone to the Plaky" support-ticket intent (Plaky invite spec):
+# a ticket that asks for Plaky access resolves straight into the same invite
+# pipeline as IPCA signing, instead of waiting for a human to run /plaky-invite.
+PLAKY_ADD_INTENT_RE = re.compile(r"\bpla[ckhy].?\b", re.IGNORECASE)
+_POSITIVE_PLAKY_VERBS = re.compile(
+    r"\b(?:add(?:ed|ing)?|invite(?:d|ing)?|grant(?:ed|ing)?|join(?:ed|ing)?|"
+    r"need(?:ed)?|want|would\s+like|set\s+(?:me|it|us|everyone)?\s*up|"
+    r"sign(?:ed)?\s+ipca|request(?:ed|ing)?|access)\b",
+    re.IGNORECASE,
+)
+_STRONG_PLAKY_VERBS = re.compile(
+    r"\b(?:add(?:ed|ing)?|need(?:ed)?|want|would\s+like|grant(?:ed|ing)?|join(?:ed|ing)?|"
+    r"sign(?:ed)?\s+ipca)\b",
+    re.IGNORECASE,
+)
+_ADD_PLAKY_VERB_RE = re.compile(r"\badd(?:ed|ing)?\b|\binvite(?:d|ing)?\b|\bjoin(?:ed|ing)?\b", re.IGNORECASE)
+_NEGATIVE_PLAKY_VERBS = re.compile(
+    r"\b(?:remove(?:d)?|offboard|deactivate|delete|kick|leave|drop|revoke|sign\s*out)\b",
+    re.IGNORECASE,
+)
+_PLAKY_REPORT_NOISE_RE = re.compile(
+    r"\b(?:worked|sent|done|ok|confirmed|finished|completed|resent|received|accepted|already\s+invited)\b",
+    re.IGNORECASE,
+)
+_ADD_TARGET_RE = re.compile(r"\badd\s+([A-Za-z][A-Za-z.'\- ]*?)\s+(?:to|onto|into)\s+pla[ckhy]", re.IGNORECASE)
+
+# In-thread "we still need your email for the Plaky invite" asks, keyed by thread
+# id, so the person's next reply (their own email, also used when they signed the
+# IPCA in the same ticket) completes the invite without a second human touch.
+PENDING_PLAKY_EMAIL_THREADS: Dict[int, Dict] = {}
+_pending_plaky_email_lock = asyncio.Lock()
+PLAKY_PENDING_ASK_TTL_SECONDS = 72 * 60 * 60
+
 # New-member onboarding: DM asks for email + role, each reply classified
 # independently (no conversation state to track/lose on a restart). IT/Security &
 # Operations Support is excluded by name before any fuzzy scoring runs -- it has
@@ -284,90 +326,20 @@ def _get_user_data(discord_id: int) -> dict:
     return data.get(str(discord_id), {})
 
 
-def _is_valid_email(email: str) -> bool:
-    pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
-    return bool(re.match(pattern, email.strip()))
-
-
-async def _call_plaky_bridge_invite(email: str, role: str = "MEMBER") -> dict:
-    if not INTERNAL_SERVICE_SECRET:
-        logger.error("INTERNAL_SERVICE_SECRET not set, cannot call bridge")
-        return {"success": False, "error": "Bridge secret not configured"}
-    url = f"{PLAKY_BRIDGE_URL}/plaky/invite"
-    headers = {
-        "Content-Type": "application/json",
-        "X-Internal-Secret": INTERNAL_SERVICE_SECRET,
-    }
-    payload = {"email": email, "role": role}
-    try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            resp = await client.post(url, json=payload, headers=headers)
-            resp.raise_for_status()
-            return resp.json()
-    except Exception as e:
-        logger.exception("Bridge invite failed")
-        return {"success": False, "error": str(e)}
-
-
-async def _call_plaky_bridge_kick(email: str) -> dict:
-    if not INTERNAL_SERVICE_SECRET:
-        logger.error("INTERNAL_SERVICE_SECRET not set, cannot call bridge")
-        return {"success": False, "error": "Bridge secret not configured"}
-    url = f"{PLAKY_BRIDGE_URL}/plaky/kick"
-    headers = {
-        "Content-Type": "application/json",
-        "X-Internal-Secret": INTERNAL_SERVICE_SECRET,
-    }
-    payload = {"email": email}
-    try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            resp = await client.post(url, json=payload, headers=headers)
-            resp.raise_for_status()
-            return resp.json()
-    except Exception as e:
-        logger.exception("Bridge kick failed")
-        return {"success": False, "error": str(e)}
-
-
 async def _resolve_member_email_for_plaky(member: discord.Member, github_username: Optional[str] = None) -> Optional[str]:
-    """Best-effort resolution of a member's Plaky email, used before a Plaky
-    kick/invite. Tries, in order of trust:
-      1. user_data (email collected during onboarding / /github-invite-request)
-      2. member_emails store on platform Postgres (self-reported at join)
-      3. GitHub public profile email (via the resolved GitHub username)
-      4. Plaky fuzzy match across GitHub real name/login + Discord names
-    Returns None rather than guessing when nothing confident is found."""
+    """Thin adapter over plaky_invite.resolve_member_email's ordered trust
+    chain (local user_data -> platform cloud DB -> GitHub public profile ->
+    Plaky roster fuzzy match), passing the Discord-side name hints that chain
+    needs for its last-resort fuzzy match."""
     if not isinstance(member, discord.Member):
         return None
-
-    user_data = _get_user_data(member.id)
-    if user_data.get("email"):
-        return user_data["email"]
-
-    email = await load_member_email(member.id)
-    if email:
-        return email
-
-    github_real_name = None
-    if github_username:
-        profile = await asyncio.to_thread(get_user_profile, github_username, GITHUB_PAT) if GITHUB_PAT else {}
-        email = profile.get("email")
-        github_real_name = profile.get("name")
-        if email:
-            return email
-
-    if not PLAKY_API_KEY:
-        return None
-    candidates = [
-        github_real_name,
-        github_username,
-        member.display_name,
-        str(getattr(member, "global_name", "") or ""),
-        str(member.name),
-    ]
-    if not any(c for c in candidates if c):
-        return None
-    return await asyncio.to_thread(find_user_email, [c for c in candidates if c], PLAKY_API_KEY)
+    member_hints = [member.display_name, str(getattr(member, "global_name", "") or ""), str(member.name)]
+    return await resolve_member_email(
+        member.id,
+        github_username=github_username,
+        member_hints=[h for h in member_hints if h],
+        api_key=PLAKY_API_KEY,
+    )
 
 
 def _discord_proxy_kwargs() -> dict:
@@ -474,6 +446,420 @@ def _is_ipca_sign_message(content: str) -> bool:
     if re.search(r"\bsigned\b", text) or re.search(r"\bsign\b", text):
         return True
     return False
+
+
+def _is_plaky_add_intent(content: str) -> bool:
+    """True when a support-ticket message is asking to ADD someone to the Plaky
+    (Joe's support-ticket spec). 'plak' + an add/join/need/want/access signal;
+    explicitly NOT a remove/offboard/kick intent. Report-style chatter ('the
+    plaky invite worked') is filtered so it doesn't re-fire the pipeline."""
+    text = (content or "").strip().lower()
+    if not PLAKY_ADD_INTENT_RE.search(text):
+        return False
+    positive = _POSITIVE_PLAKY_VERBS.search(text)
+    if not positive:
+        return False
+    negative = _NEGATIVE_PLAKY_VERBS.search(text)
+    if negative:
+        # "i need to be removed from plaky" has 'need' before 'removed' -- the
+        # negative verb still wins. Only keep as an add-intent when an explicit
+        # add/invite/join verb appears AFTER the negative ("remove X but add me").
+        strong_add = _ADD_PLAKY_VERB_RE.search(text)
+        if not strong_add or strong_add.start() < negative.start():
+            return False
+    if _PLAKY_REPORT_NOISE_RE.search(text) and not _STRONG_PLAKY_VERBS.search(text):
+        return False
+    return True
+
+
+def _email_from_text(text: str) -> Optional[str]:
+    match = EMAIL_SEARCH_RE.search(text or "")
+    return match.group(0) if match else None
+
+
+def _member_name_hints(member: Optional[discord.Member]) -> list:
+    hints = []
+    if member is None:
+        return hints
+    for attr in ("display_name", "global_name", "name"):
+        value = getattr(member, attr, None)
+        if value:
+            hints.append(str(value))
+    return hints
+
+
+async def _find_member_by_name(guild: Optional[discord.Guild], name: str) -> Optional[discord.Member]:
+    """@mention-free target: exact display/global/username match wins, then a
+    fuzzy similarity match over every member's name fields (same best_match the
+    role-picker uses). Returns None when there's no confident match -- the caller
+    then asks instead of guessing an email."""
+    if guild is None:
+        return None
+    normalized = (name or "").strip().lower()
+    if not normalized:
+        return None
+    for member in guild.members:
+        if member.bot:
+            continue
+        for candidate in (member.display_name, member.global_name, member.name):
+            if candidate and candidate.strip().lower() == normalized:
+                return member
+    pool: dict = {}
+    key_list: list = []
+    for member in guild.members:
+        if member.bot:
+            continue
+        for attr in ("display_name", "global_name", "name"):
+            key = str(getattr(member, attr, "") or "").strip().lower()
+            if key and key not in pool:
+                pool[key] = member
+                key_list.append(key)
+    match = best_match(normalized, key_list) if key_list else None
+    if match is not None:
+        return pool[key_list[match.index]]
+    return None
+
+
+async def _resolve_github_for_member(discord_id: int, member: Optional[discord.Member] = None) -> Optional[str]:
+    """GitHub identity for the invite chain: local user_data first, then the
+    platform cloud DB, then the existing github_username_map (needs the member)."""
+    entry = get_user_data(discord_id)
+    if entry.get("github_username"):
+        return entry["github_username"]
+    cloud = await load_member_profile(discord_id)
+    if cloud.get("github_username"):
+        return cloud["github_username"]
+    if member is not None:
+        return _get_github_username_for_member(member)
+    return None
+
+
+async def _pending_plaky_ask_pop(thread_id: int) -> Optional[dict]:
+    async with _pending_plaky_email_lock:
+        entry = PENDING_PLAKY_EMAIL_THREADS.get(thread_id)
+        if not entry:
+            return None
+        if time.time() - float(entry.get("requested_at", 0)) > PLAKY_PENDING_ASK_TTL_SECONDS:
+            PENDING_PLAKY_EMAIL_THREADS.pop(thread_id, None)
+            return None
+        return PENDING_PLAKY_EMAIL_THREADS.pop(thread_id)
+
+
+async def _pending_plaky_ask_set(thread_id: int, entry: dict) -> None:
+    async with _pending_plaky_email_lock:
+        PENDING_PLAKY_EMAIL_THREADS[thread_id] = entry
+
+
+async def _invite_member_to_plaky(
+    *,
+    discord_id: int,
+    discord_username: str,
+    member: Optional[discord.Member] = None,
+    github_username: Optional[str] = None,
+    email: Optional[str] = None,
+    role: str = "MEMBER",
+) -> tuple:
+    """Core invite pipeline: resolve an email through the ordered chain
+    (local -> cloud DB -> GitHub profile -> Plaky roster), then hand it to the
+    headless bridge. Returns (status, email) where status is one of:
+    'ok', 'already', 'asked', 'failed:<reason>'. Every capture feeds both the
+    local user_data mirror and the platform cloud DB."""
+    if not email:
+        email = await resolve_member_email(
+            discord_id,
+            github_username=github_username,
+            member_hints=_member_name_hints(member),
+            api_key=PLAKY_API_KEY or None,
+        )
+    if not email:
+        return ("asked", None)
+    result = await call_plaky_bridge_invite(email, role=role)
+    if result.get("success"):
+        await persist_member_email(discord_id, discord_username, email, github_username=github_username)
+        return ("ok", email)
+    await remember_user_data(discord_id, email=email, github_username=github_username)
+    if result.get("already"):
+        return ("already", email)
+    return (f"failed:{result.get('error') or 'bridge error'}", email)
+
+
+def _plaky_invite_status_text(status: str, email: Optional[str], sender_mention: str) -> str:
+    if status == "ok":
+        return f"✅ Plaky invite sent to **{email}** — they just need to accept it from their inbox."
+    if status == "already":
+        return f"ℹ️ **{email}** is already in the Plaky workspace — nothing to do."
+    if status == "asked":
+        return (
+            f"{sender_mention} I need their email to send the Plaky invite. "
+            "Reply in this thread with the address (for example `jane@deepiri.com`) and I'll take it from there."
+        )
+    reason = status.split(":", 1)[1] if ":" in status else status
+    return f"⚠️ Plaky invite for **{email or '?'}** failed: {reason}"
+
+
+async def _maybe_handle_plaky_pending_email_reply(message: discord.Message) -> bool:
+    """Completes a pending email ask for a Plaky invite. Two shapes:
+
+    - A ticket thread that was asked in-thread for the invite address -- the
+      next message carrying one completes the invite for the pending member.
+    - A DM reply to the email ask Norozo sent after an IPCA sign (the DM is
+      framed purely as 'adding you to Plaky'; the captured address also goes on
+      file via the usual persistence chain -- nothing here ever mentions
+      offboarding).
+
+    Replays in whatever channel the ask was issued."""
+    if message.author.bot:
+        return False
+    if message.guild is None:
+        if not isinstance(message.channel, discord.DMChannel):
+            return False
+        entry = await _pending_plaky_ask_pop(message.channel.id)
+        if entry is None or str(entry.get("discord_id") or "") != str(message.author.id):
+            return False
+        email = _email_from_text(message.content or "")
+        if not email:
+            # Still waiting on the address -- don't let another handler eat the reply.
+            await _pending_plaky_ask_set(message.channel.id, entry)
+            return True
+        status, used_email = await _invite_member_to_plaky(
+            discord_id=message.author.id,
+            discord_username=str(message.author),
+            github_username=entry.get("github_username"),
+            email=email,
+            role=entry.get("role") or "MEMBER",
+        )
+        await message.channel.send(_plaky_invite_status_text(status, used_email or email, ""))
+        return True
+    if not isinstance(message.channel, discord.Thread):
+        return False
+    entry = await _pending_plaky_ask_pop(message.channel.id)
+    if not entry:
+        return False
+    email = _email_from_text(message.content or "")
+    if not email:
+        # Still waiting on the address -- don't let another handler eat the reply.
+        await _pending_plaky_ask_set(message.channel.id, entry)
+        return True
+    status, used_email = await _invite_member_to_plaky(
+        discord_id=int(entry.get("discord_id") or message.author.id),
+        discord_username=str(message.author),
+        github_username=entry.get("github_username"),
+        email=email,
+        role=entry.get("role") or "MEMBER",
+    )
+    reply_channel = await _resolve_reply_channel(message)
+    await reply_channel.send(_plaky_invite_status_text(status, used_email or email, message.author.mention))
+    return True
+
+
+async def _maybe_handle_plaky_add_request(message: discord.Message) -> bool:
+    """Support-ticket intent: 'I want to add someone to the Plaky' /
+    'I need to be added to Plaky'. Resolves who's being added (mention wins,
+    then self, then a named member, then ask), resolves the email, invites, or
+    starts an in-thread ask for the address. Returns True when it handled it."""
+    if message.guild is None or message.author.bot:
+        return False
+    if not isinstance(message.author, discord.Member):
+        return False
+    if not _is_support_sessions_channel(message.channel):
+        return False
+    content = (message.content or "").strip()
+    if not content or not _is_plaky_add_intent(content):
+        return False
+
+    guild = message.guild
+    reply_channel = await _resolve_reply_channel(message)
+
+    mentioned = next((m for m in getattr(message, "mentions", []) if isinstance(m, discord.Member) and not m.bot), None)
+    email = _email_from_text(content)
+    target: Optional[discord.Member] = mentioned
+    github_username: Optional[str] = None
+
+    if target is not None and target.id == message.author.id:
+        target = None  # self-mention counts as self-request
+    if target is None and _is_self_add_phrasing(content):
+        target = message.author
+    if target is None:
+        named = _extract_add_target_name(content)
+        if named:
+            target = await _find_member_by_name(guild, named)
+            if target is None:
+                github_username = _extract_github_profile_username(content) if URL_RE.search(content) else None
+
+    if target is not None:
+        github_username = github_username or await _resolve_github_for_member(target.id, target)
+        status, used_email = await _invite_member_to_plaky(
+            discord_id=target.id,
+            discord_username=str(target),
+            member=target,
+            github_username=github_username,
+            email=email,
+            role="MEMBER",
+        )
+        if status == "asked":
+            await _pending_plaky_ask_set(
+                reply_channel.id if getattr(reply_channel, "id", None) else message.channel.id,
+                {
+                    "discord_id": target.id,
+                    "github_username": github_username,
+                    "role": "MEMBER",
+                    "requested_at": time.time(),
+                    "sender_id": message.author.id,
+                },
+            )
+        await reply_channel.send(_plaky_invite_status_text(status, used_email or email, message.author.mention))
+        return True
+
+    # No member resolved but the message carried an email -- invite that address
+    # and keep the record attached to the requester (best available attribution).
+    if email:
+        status, used_email = await _invite_member_to_plaky(
+            discord_id=message.author.id,
+            discord_username=str(message.author),
+            member=message.author,
+            github_username=github_username,
+            email=email,
+            role="MEMBER",
+        )
+        await reply_channel.send(_plaky_invite_status_text(status, used_email or email, message.author.mention))
+        return True
+
+    await reply_channel.send(
+        f"{message.author.mention} Who should I add to the Plaky? Ping the person here "
+        "or paste their email directly and I'll set it up."
+    )
+    return True
+
+
+def _is_self_add_phrasing(content: str) -> bool:
+    low = (content or "").lower()
+    if re.search(r"\b(?:me|myself)\b", low):
+        return True
+    return re.search(r"\bi\s+(?:want|need|would\s+like|want\s+to|need\s+to|should)\b", low) is not None
+
+
+def _extract_add_target_name(content: str) -> Optional[str]:
+    """'add <name> to plaky' -> the name; 'add me/someone' returns None so the
+    caller routes those to self/ask paths."""
+    match = _ADD_TARGET_RE.search(content or "")
+    if not match:
+        return None
+    candidate = match.group(1).strip()
+    if not candidate or candidate.lower() in ("me", "myself", "i", "someone", "a person", "the person"):
+        return None
+    if candidate.endswith(" to the") or candidate.endswith(" to"):
+        return None
+    return candidate
+
+
+async def _maybe_auto_invite_to_plaky(message: discord.Message, member: discord.Member) -> None:
+    """IPCA-sign side effect: once roles are granted, the same ticket message
+    also kicks off the Plaky invite (email from the message, GitHub link if
+    present, then the resolution chain). If the email can't be resolved the
+    signer is DM'd straight away to send it -- phrased purely as setting up
+    their Plaky access -- and the pending ask is keyed off that DM. When the
+    member's DMs are closed (or the ask otherwise can't be DM'd) it falls back
+    to the in-thread ask. The address they reply with is recorded on file via
+    the usual persistence chain; nothing surfaces that the record also serves
+    future offboarding."""
+    content = message.content or ""
+    email = _email_from_text(content)
+    github_username = None
+    if URL_RE.search(content):
+        candidate = _extract_github_profile_username(content)
+        if candidate:
+            github_username = candidate
+            try:
+                await _remember_identity(member.id, candidate, member)
+            except Exception:
+                logger.exception("Failed to remember GitHub username %s during Plaky invite", candidate)
+    status, used_email = await _invite_member_to_plaky(
+        discord_id=member.id,
+        discord_username=str(member),
+        member=member,
+        github_username=github_username or await _resolve_github_for_member(member.id, member),
+        email=email,
+        role="MEMBER",
+    )
+    reply_channel = await _resolve_reply_channel(message)
+    if status == "asked":
+        dm_ask = await _send_plaky_dm_email_ask(member)
+        if dm_ask is not None:
+            await _pending_plaky_ask_set(
+                dm_ask.channel.id,
+                {
+                    "discord_id": member.id,
+                    "github_username": github_username,
+                    "role": "MEMBER",
+                    "requested_at": time.time(),
+                    "sender_id": member.id,
+                    "via": "dm",
+                },
+            )
+            await reply_channel.send(
+                f"📩 Sent {member.mention} a DM for their email to set up the Plaky invite — no action needed from you."
+            )
+            return
+        await _pending_plaky_ask_set(
+            reply_channel.id if getattr(reply_channel, "id", None) else message.channel.id,
+            {
+                "discord_id": member.id,
+                "github_username": github_username,
+                "role": "MEMBER",
+                "requested_at": time.time(),
+                "sender_id": member.id,
+                "via": "thread",
+            },
+        )
+    await reply_channel.send(_plaky_invite_status_text(status, used_email or email, member.mention))
+
+
+def _plaky_dm_ask_text(member_name: str) -> str:
+    """DM copy for the IPCA-sign Plaky email ask. Deliberately only ever talks
+    about setting up Plaky access -- never about having the address on file for
+    future offboarding."""
+    return (
+        f"Hey {member_name}! I'm setting you up on the Deepiri Plaky workspace so "
+        "you can track your tickets alongside the team. Just reply here with the "
+        "email you'd like me to invite (e.g. `jane@deepiri.com`) and I'll sort the "
+        "invite out from there."
+    )
+
+
+async def _send_plaky_dm_email_ask(member: discord.Member):
+    """DM the IPCA signer asking for the Plaky-invite email, framed purely as
+    workspace setup. Returns the created DM message on success (the caller keys
+    the pending ask off its channel id), or None when the member can't be DM'd
+    and the ask has to fall back to the ticket thread."""
+    try:
+        return await member.send(_plaky_dm_ask_text(member.display_name or member.name or "there"))
+    except discord.Forbidden:
+        return None
+    except Exception:
+        logger.exception("Failed to DM %s the Plaky email ask", member.id)
+        return None
+
+
+async def _maybe_handle_plaky_kick_on_kickout(message: discord.Message, target: discord.Member) -> str:
+    """Best-effort Plaky deactivate during kick-out: resolve the target's email
+    (already-loaded identity chain) and hand it to the bridge. Returns a short
+    status line for the kick-out summary."""
+    try:
+        email = await resolve_member_email(
+            target.id,
+            github_username=_get_github_username_for_member(target),
+            member_hints=_member_name_hints(target),
+            api_key=PLAKY_API_KEY or None,
+        )
+    except Exception:
+        logger.exception("Plaky email resolution failed for kick-out target %s", target.id)
+        return "Plaky: email resolution failed"
+    if not email:
+        return "Plaky: no email on file, skipped"
+    result = await call_plaky_bridge_kick(email)
+    if result.get("success"):
+        return f"Plaky: deactivated {email}"
+    return f"Plaky: kick failed ({result.get('error')})"
 
 
 async def _maybe_auto_assign_ipca_roles(message: discord.Message) -> bool:
@@ -1634,7 +2020,7 @@ async def handle_offboard_user(interaction: discord.Interaction, member: discord
     if isinstance(member, discord.Member):
         user_email = await _resolve_member_email_for_plaky(member, normalized_username)
         if user_email:
-            plaky_result = await _call_plaky_bridge_kick(user_email)
+            plaky_result = await call_plaky_bridge_kick(user_email)
             if plaky_result.get("success"):
                 plaky_note = f"removed {user_email}"
             else:
@@ -1678,7 +2064,7 @@ async def handle_discord_kick(interaction: discord.Interaction, member: discord.
     # Also kick out of Plaky if we can resolve their email (best-effort).
     user_email = await _resolve_member_email_for_plaky(member)
     if user_email:
-        plaky_result = await _call_plaky_bridge_kick(user_email)
+        plaky_result = await call_plaky_bridge_kick(user_email)
         if not plaky_result.get("success"):
             logger.warning("Plaky kick failed for %s via /discord-kick: %s", user_email, plaky_result.get("error"))
 
@@ -1908,6 +2294,7 @@ async def _maybe_handle_onboarding_dm(message: discord.Message) -> bool:
         email = email_match.group(0)
         ok = await save_member_email(message.author.id, str(message.author), email)
         if ok:
+            remember_user_data(message.author.id, email=email)
             await message.channel.send(f"Got it — saved {email} on file. Thanks!")
         else:
             logger.error("Failed to persist member email for %s", message.author.id)
@@ -1938,6 +2325,7 @@ async def _maybe_handle_onboarding_dm(message: discord.Message) -> bool:
         # reverse lookup), so this fills in for members who joined before it
         # existed too, not just fresh onboarding.
         await _remember_identity(message.author.id, github_username, message.author)
+        remember_user_data(message.author.id, github_username=github_username)
         await message.channel.send(f"Got it — linked your GitHub as **{github_username}**.")
         return True
 
@@ -2179,7 +2567,7 @@ async def _maybe_handle_kick_out_command(message: discord.Message) -> bool:
     plaky_note = "no email on file, skipped"
     user_email = await _resolve_member_email_for_plaky(target, github_username)
     if user_email:
-        plaky_result = await _call_plaky_bridge_kick(user_email)
+        plaky_result = await call_plaky_bridge_kick(user_email)
         plaky_ok = bool(plaky_result.get("success"))
         plaky_note = user_email if plaky_ok else f"{user_email} — {plaky_result.get('error')}"
         if not plaky_ok:
@@ -2191,6 +2579,8 @@ async def _maybe_handle_kick_out_command(message: discord.Message) -> bool:
         f"{'✅' if plaky_ok else '⚠️'} Plaky removal: {plaky_note}\n"
         f"📧 Termination notice: {notice_outcome}"
     )
+    plaky_summary = await _maybe_handle_plaky_kick_on_kickout(message, target)
+    summary += f"\n📋 {plaky_summary}"
     summary_channel = await _resolve_reply_channel(message)
     await summary_channel.send(summary)
     if STAFF_CHANNEL_ID:
@@ -2411,6 +2801,50 @@ async def handle_ipca_signed(interaction: discord.Interaction, github_username: 
     await interaction.edit_original_response(content="Your approval request was sent to staff for review.")
 
 
+async def handle_plaky_invite(
+    interaction: discord.Interaction,
+    member: Optional[discord.Member] = None,
+    email: Optional[str] = None,
+) -> None:
+    """/plaky-invite -- staff/security-ops invite a member (or a raw address)
+    to the Plaky right now. Uses the same resolution chain + headless bridge as
+    the automated ticket/IPCA paths."""
+    if not isinstance(interaction.user, discord.Member) or not _is_staff_or_security_ops(interaction.user):
+        await interaction.response.send_message(
+            "Only Admins or Security & Operations Support can run this command.", ephemeral=True
+        )
+        return
+
+    target = member or interaction.user
+    provided_email = (email or "").strip()
+    if provided_email and not is_valid_email(provided_email):
+        await interaction.response.send_message("That doesn't look like a valid email address.", ephemeral=True)
+        return
+
+    github_username = await _resolve_github_for_member(target.id, target if isinstance(target, discord.Member) else None)
+    if provided_email:
+        status, used_email = await _invite_member_to_plaky(
+            discord_id=target.id,
+            discord_username=str(target),
+            member=target if isinstance(target, discord.Member) else None,
+            github_username=github_username,
+            email=provided_email,
+            role="MEMBER",
+        )
+    else:
+        status, used_email = await _invite_member_to_plaky(
+            discord_id=target.id,
+            discord_username=str(target),
+            member=target if isinstance(target, discord.Member) else None,
+            github_username=github_username,
+            role="MEMBER",
+        )
+    if status == "asked":
+        await interaction.response.send_message(f"No email on file for {target} — supply one with the `email:` option.", ephemeral=True)
+        return
+    await interaction.response.send_message(_plaky_invite_status_text(status, used_email, interaction.user.mention), ephemeral=True)
+
+
 def _register_slash_commands(target_bot: DeepiriBot) -> None:
     @target_bot.tree.command(name="github-invite-request", description="Request a GitHub invite after signing ICPA")
     @app_commands.describe(
@@ -2489,6 +2923,11 @@ def _register_slash_commands(target_bot: DeepiriBot) -> None:
 
         await interaction.response.send_message(result.get("message", "Failed to create Plaky task."), ephemeral=True)
 
+
+    @target_bot.tree.command(name="plaky-invite", description="Invite a member to the Plaky (staff only)")
+    @app_commands.describe(member="The Discord member to invite", email="Their email, if not on file yet")
+    async def plaky_invite(interaction: discord.Interaction, member: discord.Member | None = None, email: str | None = None) -> None:
+        await handle_plaky_invite(interaction, member, email)
 
     @target_bot.tree.command(name="plaky-status", description="Post open Plaky tasks summary to QA channel")
     async def plaky_status(interaction: discord.Interaction) -> None:
@@ -2582,20 +3021,6 @@ def _register_slash_commands(target_bot: DeepiriBot) -> None:
 
         for i in range(len(option_list)):
             await poll_message.add_reaction(_poll_option_emoji(i))
-
-    @target_bot.tree.command(name="plaky-invite", description="Invite a user to Plaky (staff only)")
-    @app_commands.describe(email="Email address to invite")
-    async def plaky_invite(interaction: discord.Interaction, email: str) -> None:
-        if not isinstance(interaction.user, discord.Member) or not _is_staff(interaction.user):
-            await interaction.response.send_message("Staff only command.", ephemeral=True)
-            return
-        await interaction.response.defer(ephemeral=True)
-        result = await _call_plaky_bridge_invite(email)
-        if result.get("success"):
-            await interaction.followup.send(result.get("message", f"Invite sent to {email}"))
-        else:
-            await interaction.followup.send(f"Invite failed: {result.get('error', 'Unknown error')}")
-
 
 async def plaky_webhook_handler(request: web.Request) -> web.Response:
     raw_body = await request.read()
@@ -3102,11 +3527,19 @@ def _create_and_register_bot() -> DeepiriBot:
         if message.author.bot:
             return
         if message.guild is None:
+            # A DM reply to the Plaky email ask sent after an IPCA sign outranks
+            # onboarding so the invite gets completed and confirmed in-DM.
+            if await _maybe_handle_plaky_pending_email_reply(message):
+                await new_bot.process_commands(message)
+                return
+            # Falls through to the older, volatile in-memory ask -- set by the
+            # auto-invite-after-role-assignment flow, which doesn't go through
+            # the persistent per-channel pending-ask store above.
             if message.author.id in pending_email_requests:
                 email = message.content.strip()
-                if _is_valid_email(email):
+                if is_valid_email(email):
                     _remember_user_data(message.author.id, email=email)
-                    result = await _call_plaky_bridge_invite(email)
+                    result = await call_plaky_bridge_invite(email)
                     if result.get("success"):
                         await message.channel.send(f"Plaky invite sent to {email}")
                     else:
@@ -3129,28 +3562,18 @@ def _create_and_register_bot() -> DeepiriBot:
         if await _maybe_handle_retirement_announcement(message):
             await new_bot.process_commands(message)
             return
-        roles_assigned = await _maybe_auto_assign_ipca_roles(message)
-
-        if roles_assigned and isinstance(message.author, discord.Member):
-            user_data = _get_user_data(message.author.id)
-            has_plaky_email = bool(user_data.get("email") or await load_member_email(message.author.id))
-            if not has_plaky_email:
-                try:
-                    await message.author.send(
-                        "Please provide your email address so we can send you a Plaky invite. "
-                        "Reply to this DM with your email (e.g., name@domain.com)."
-                    )
-                    pending_email_requests[message.author.id] = True
-                except discord.Forbidden:
-                    logger.warning("Cannot DM %s, they may have DMs disabled", message.author.id)
-            else:
-                email = await _resolve_member_email_for_plaky(message.author)
-                result = await _call_plaky_bridge_invite(email)
-                if result.get("success"):
-                    await message.channel.send(f"{message.author.mention} Plaky invite sent to {email}")
-                else:
-                    await message.channel.send(f"{message.author.mention} Plaky invite failed: {result.get('error')}")
-
+        if await _maybe_handle_plaky_pending_email_reply(message):
+            # A ticket thread that was asked for its invite email answered it.
+            await new_bot.process_commands(message)
+            return
+        if await _maybe_handle_plaky_add_request(message):
+            await new_bot.process_commands(message)
+            return
+        ipca_assigned = await _maybe_auto_assign_ipca_roles(message)
+        if ipca_assigned and isinstance(message.author, discord.Member):
+            # Same ticket message that signed the IPCA also triggers the Plaky
+            # invite (email from the message, then the resolution chain/ask).
+            await _maybe_auto_invite_to_plaky(message, message.author)
         if _is_announcements_channel(message.channel):
             title = format_discussion_title(resolve_discord_mentions(message, message.content or ""))
             body = format_discussion_body(message)
