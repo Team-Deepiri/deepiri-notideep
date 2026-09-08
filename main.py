@@ -21,12 +21,13 @@ from dotenv import load_dotenv
 
 from bot import format_discussion_body, format_discussion_title, resolve_discord_mentions
 from emailer import send_email
-from github import add_user_to_team, get_user_profile, invite_user, is_org_member, list_org_members, remove_user_from_org, remove_user_from_team
+from github import add_user_to_team, get_pull_request, get_pull_request_reviews, get_user_profile, invite_user, is_org_member, list_open_prs, list_org_members, remove_user_from_org, remove_user_from_team
 from identity_match import best_match
 from github_discussion import GitHubDiscussionError, create_github_discussion
 from meetings import setup_meeting_features
 from onboarding import ApprovalView
-from member_email_store import load_member_email, save_member_email
+from member_email_store import load_member_profile, save_member_email, save_member_real_name
+from pr_staleness_store import claim_pr_staleness_1month, find_discord_id_by_email, load_pr_staleness, save_pr_staleness
 from plaky import create_task, find_user_email, get_tasks
 from state_store import load_last_online_at, save_last_online_at
 
@@ -69,7 +70,7 @@ STAFF_ROLE_ID = _int_env("STAFF_ROLE_ID")
 SUPPORT_SESSIONS_CHANNEL_ID = _int_env("SUPPORT_SESSIONS_CHANNEL_ID")  # #support-tickets 1435722355723993088
 GITHUB_PROFILES_CHANNEL_ID = _int_env("GITHUB_PROFILES_CHANNEL_ID")  # #github-profiles 1435086187822845982
 IT_OPERATIONS_SUPPORT_ROLE_ID = _int_env("IT_OPERATIONS_SUPPORT_ROLE_ID") or _int_env("SUPPORT_TEAM_ROLE_ID")
-QA_ROLE_ID = _int_env("QA_ROLE_ID")
+QA_ROLE_ID = _int_env("QA_ROLE_ID")  # "QA" Discord role -- also gates PR-staleness QA reviewer pings; must be set explicitly
 ANNOUNCEMENTS_CHANNEL_ID = _int_env("DISCORD_CHANNEL_ID") or _int_env("ANNOUNCEMENTS_CHANNEL_ID")  # #announcements 1436509524818395156
 ANNOUNCEMENTS_CHANNEL_NAME = os.getenv("DISCORD_CHANNEL_NAME", "announcements")
 
@@ -82,6 +83,50 @@ KICK_OUT_COMMAND_CHANNEL_IDS = {
     cid for cid in (SUPPORT_SESSIONS_CHANNEL_ID, ADMIN_TERMINAL_CHANNEL_ID, IT_KICK_LIST_CHANNEL_ID) if cid is not None
 }
 KICK_OUT_COMMAND_RE = re.compile(r"^\s*kick\s*(?:out)?\s+(.+)$", re.IGNORECASE)
+
+# "@Someone is retiring" / "@Someone retiring as well" / "@Someone is leaving
+# Deepiri" -- voluntary offboarding, triggered by "retiring" anywhere in a
+# message, or the exact combined phrase "leaving deepiri" (not just both
+# words separately in the same sentence) -- staff-only, since it leads to the
+# same Discord kick + GitHub org removal as kick-out. Falls back to the
+# current thread's ticket creator when no @mention is present.
+RETIRING_TRIGGER_RE = re.compile(r"\bretiring\b|\bleaving\s+deepiri\b", re.IGNORECASE)
+
+# PR staleness escalation: 2 weeks -> #qa-support-team (one-time, includes the
+# assigned QA reviewer), 2.5 weeks -> recurring DM to the author AND, separately,
+# to any assigned QA reviewer who hasn't reviewed yet (cadence tightens with
+# age), 2.5 months -> #announcements (public, one-time -- never repeats no matter
+# how much older the PR gets).
+# Env-overridable, defaulting to the IDs actually in use.
+PR_STALE_QA_CHANNEL_ID = _int_env("PR_STALE_QA_CHANNEL_ID") or 1438705614649032755  # #qa-support-team
+# 1-month tier posts to the same #announcements channel used everywhere else --
+# no separate env var, just reuse ANNOUNCEMENTS_CHANNEL_ID.
+# Repos that never count toward staleness at all, for anyone -- demo/scratch
+# repos and the org's .github repo (community-health-file config, not a real
+# project repo). Matched case-insensitively against just the repo name (after
+# the "org/").
+PR_STALE_EXCLUDED_REPOS = {"deepiri-demo", ".github"}
+# Narrower exclusion: specific authors excluded only within specific repos --
+# no QA-channel post, no DM, no reminder of any kind for these, but other
+# authors' PRs in the same repo are still tracked normally.
+PR_STALE_EXCLUDED_AUTHORS_PER_REPO = {"diva": {"jrb00013"}}
+PR_STALE_2WEEK_DAYS = 14
+PR_STALE_2_5WEEK_DAYS = 17.5  # when the recurring author/QA-reviewer DMs start
+PR_STALE_3WEEK_DAYS = 21
+PR_STALE_DM_DAILY_DAYS = 30  # 1 month+ -> DM cadence tightens to daily
+PR_STALE_ANNOUNCE_DAYS = 75  # 2.5 months -> one-time public #announcements post
+PR_STALE_SCAN_INTERVAL_SECONDS = 6 * 60 * 60  # 6 hours -- PR age changes slowly
+
+
+def _pr_stale_dm_cadence_days(age_days: float) -> float:
+    """How often to re-nag (author or assigned QA reviewer) once a PR has
+    crossed the 2-week mark: weekly at first, every 3 days past 3 weeks,
+    daily once it's a month+ old."""
+    if age_days >= PR_STALE_DM_DAILY_DAYS:
+        return 1.0
+    if age_days >= PR_STALE_3WEEK_DAYS:
+        return 3.0
+    return 7.0
 
 WEBHOOK_HOST = os.getenv("WEBHOOK_HOST", "0.0.0.0")
 WEBHOOK_PORT = int(os.getenv("PORT") or os.getenv("WEBHOOK_PORT", "8080"))
@@ -337,11 +382,7 @@ async def _maybe_auto_assign_ipca_roles(message: discord.Message) -> bool:
     # passed since the send above, during which the companion thread may have
     # only just been created.
     ticket_thread = await _resolve_reply_channel(message)
-    if isinstance(ticket_thread, discord.Thread):
-        try:
-            await ticket_thread.edit(archived=True, locked=False, reason="IPCA signed — ticket resolved")
-        except Exception:
-            logger.exception("Failed to archive IPCA ticket thread %s", ticket_thread.id)
+    await _close_ticket_thread(ticket_thread)
 
     return True
 
@@ -504,6 +545,45 @@ def _remember_github_username(discord_id: int, github_username: str) -> None:
     _save_github_username_map(mapping)
 
 
+_LOOKS_LIKE_REAL_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z.'-]*\s+[A-Za-z][A-Za-z.'-]*$")
+
+
+async def _remember_identity(discord_id: int, github_username: str, member: Optional[discord.Member] = None) -> None:
+    """Persists the discord_id<->github_username mapping AND opportunistically
+    caches their real name, whichever path just resolved this identity --
+    a self-reported GitHub link at onboarding, a #github-profiles scan match,
+    an org-roster fuzzy match, or a PR-staleness reverse lookup. This is the
+    dynamic identity cache growing itself: every successful resolution feeds
+    it, not just the one at onboarding, so it fills in for members who joined
+    before this existed too.
+
+    Prefers GitHub's public profile name (a genuine "real name" field), but
+    falls back to the Discord global_name/display_name when GitHub has none
+    set AND that name is actually "First Last"-shaped -- Discord's own
+    display name is frequently someone's real name too, and a name this
+    specific is a far better identity-search candidate than the raw handle,
+    even without GitHub confirming it.
+    """
+    _remember_github_username(discord_id, github_username)
+    real_name = None
+    if GITHUB_PAT:
+        try:
+            profile = await asyncio.to_thread(get_user_profile, github_username, GITHUB_PAT)
+            real_name = profile.get("name")
+        except Exception:
+            logger.exception("Failed to fetch GitHub profile for %s (%s)", discord_id, github_username)
+    if not real_name and member is not None:
+        for candidate in (str(getattr(member, "global_name", "") or ""), str(getattr(member, "display_name", "") or "")):
+            if candidate and _LOOKS_LIKE_REAL_NAME_RE.match(candidate.strip()):
+                real_name = candidate.strip()
+                break
+    if real_name:
+        try:
+            await save_member_real_name(discord_id, real_name, github_username)
+        except Exception:
+            logger.exception("Failed to cache real name for %s (%s)", discord_id, github_username)
+
+
 def _get_github_username_for_member(member: discord.Member) -> Optional[str]:
     """Return an explicitly mapped username, or a best-effort name-based guess.
 
@@ -554,7 +634,7 @@ async def _find_github_username_in_profiles_channel(member: discord.Member) -> O
                 logger.warning("Found GitHub link %s for %s in #github-profiles but they're not in %s", candidate, member.id, GITHUB_ORG)
                 continue
             logger.info("#github-profiles: matched %s -> %s after scanning %s messages", member.id, candidate, scanned)
-            _remember_github_username(member.id, candidate)
+            await _remember_identity(member.id, candidate, member)
             return candidate
     except Exception:
         logger.exception("Failed scanning #github-profiles for member %s", member.id)
@@ -588,10 +668,268 @@ async def _find_github_username_via_org_roster(member: discord.Member) -> Option
         match = best_match(candidate_name, usernames)
         if match is not None:
             logger.info("Org roster fallback: matched %s (query %r) -> %s", member.id, candidate_name, usernames[match.index])
-            _remember_github_username(member.id, usernames[match.index])
+            await _remember_identity(member.id, usernames[match.index], member)
             return usernames[match.index]
     logger.warning("Org roster fallback for %s: no confident match among %s org members", member.id, len(usernames))
     return None
+
+
+async def _resolve_discord_member_for_github_login(login: str, guild: discord.Guild) -> Optional[discord.Member]:
+    """Reverse direction of the GitHub<->Discord identity chain used everywhere
+    else this session (kick-out resolves Discord->GitHub; this resolves
+    GitHub->Discord for PR staleness pings), going through Plaky as an
+    intermediate hop for more context when GitHub/Discord alone aren't enough:
+
+    1. Reverse-check the persisted github_username_map -- if some discord_id
+       already maps to this login (built by kick-out's resolution + the
+       onboarding DM's github-link capture), done instantly.
+    2. GitHub's real display name fuzzy-matched against current guild members'
+       display_name/global_name/name (identity_match.best_match, same
+       refuse-rather-than-guess philosophy as everywhere else).
+    3. Plaky hop: find_user_email([login, real_name], ...) -- if Plaky has this
+       person under a self-reported email, reverse-look that email up against
+       member_emails (self-reported at onboarding) to land on a discord_id
+       directly.
+
+    Persists a successful match back into the github_username_map so this
+    resolves instantly next time. Returns None (never guesses) if nothing
+    confident is found anywhere in the chain.
+    """
+    if not login:
+        return None
+
+    mapping = _load_github_username_map()
+    login_lower = login.strip().lower()
+    for discord_id_str, mapped_login in mapping.items():
+        if mapped_login.strip().lower() == login_lower:
+            member = guild.get_member(int(discord_id_str))
+            if member is not None:
+                return member
+
+    profile = await asyncio.to_thread(get_user_profile, login, GITHUB_PAT) if GITHUB_PAT else {"name": None, "email": None}
+    real_name = profile.get("name")
+
+    if real_name:
+        candidate_members = list(guild.members)
+        candidate_names = [m.display_name for m in candidate_members]
+        match = best_match(real_name, candidate_names)
+        if match is not None:
+            member = candidate_members[match.index]
+            await _remember_identity(member.id, login, member)
+            logger.info("PR staleness identity: matched GitHub %s (name %r) -> Discord %s via name fuzzy match", login, real_name, member.id)
+            return member
+
+    if PLAKY_API_KEY:
+        plaky_email = await asyncio.to_thread(find_user_email, [n for n in (real_name, login) if n], PLAKY_API_KEY)
+        if plaky_email:
+            discord_id_str = await find_discord_id_by_email(plaky_email)
+            if discord_id_str:
+                try:
+                    member = guild.get_member(int(discord_id_str))
+                except ValueError:
+                    member = None
+                if member is not None:
+                    await _remember_identity(member.id, login, member)
+                    logger.info("PR staleness identity: matched GitHub %s -> Plaky email %s -> Discord %s", login, plaky_email, member.id)
+                    return member
+
+    logger.warning("PR staleness identity: could not resolve GitHub login %s to any Discord member", login)
+    return None
+
+
+async def _resolve_pr_qa_reviewers(pr: dict, guild: discord.Guild) -> list:
+    """Requested reviewers on the PR who hold the QA Discord role, resolved via
+    the same GitHub->Discord identity chain used for the author. Returns a list
+    of (github_login, discord.Member) pairs -- only those that both resolve to
+    a Discord member AND hold QA_ROLE_ID count as "assigned QA" for staleness
+    purposes."""
+    full_pr = await asyncio.to_thread(get_pull_request, pr["repo"], pr["number"], GITHUB_PAT)
+    if not full_pr:
+        return []
+    requested = full_pr.get("requested_reviewers") or []
+    logins = [r.get("login") for r in requested if r.get("login")]
+    resolved = []
+    for login in logins:
+        member = await _resolve_discord_member_for_github_login(login, guild)
+        if member is not None and member.get_role(QA_ROLE_ID) is not None:
+            resolved.append((login, member))
+    return resolved
+
+
+async def _pr_already_reviewed_by(pr: dict, login: str) -> bool:
+    """Any submitted review (approve/request-changes/comment) counts as
+    "weighed in" -- they're off the nag list regardless of the review outcome."""
+    reviews = await asyncio.to_thread(get_pull_request_reviews, pr["repo"], pr["number"], GITHUB_PAT)
+    login_lower = login.strip().lower()
+    return any((r.get("user") or {}).get("login", "").strip().lower() == login_lower for r in reviews)
+
+
+async def _post_pr_staleness_qa_channel(pr: dict, qa_reviewers: list) -> None:
+    repo, number, title, url = pr["repo"], pr["number"], pr["title"], pr["html_url"]
+    channel = await _channel_from_id(PR_STALE_QA_CHANNEL_ID)
+    if channel is None:
+        return
+    if qa_reviewers:
+        assigned = ", ".join(member.mention for _login, member in qa_reviewers)
+        cta = "Let's get this merged when you can!"
+    else:
+        assigned = "No QA assigned"
+        cta = "Let's get this assigned!"
+    try:
+        await channel.send(
+            f"PR #{number} in {repo} (\"{title}\") has been open 2 weeks: {url}\nAssigned QA: {assigned}\n{cta}"
+        )
+    except Exception:
+        logger.exception("Failed to post 2-week PR staleness notice for %s#%s", repo, number)
+
+
+async def _dm_pr_staleness_nudge(member: discord.Member, pr: dict, *, as_reviewer: bool) -> None:
+    repo, number, title, url = pr["repo"], pr["number"], pr["title"], pr["html_url"]
+    if as_reviewer:
+        text = (
+            f"Hey — you're assigned as QA on PR #{number} in {repo} (\"{title}\") and it hasn't been "
+            f"reviewed yet from your end. Take a look when you get a chance: {url}"
+        )
+    else:
+        text = (
+            f"Hey — your PR #{number} in {repo} (\"{title}\") is still open. "
+            f"No pressure, just a nudge to take a look when you get a chance: {url}"
+        )
+    try:
+        await member.send(text)
+    except Exception:
+        logger.exception("Failed to DM PR staleness nudge to %s for %s#%s", member.id, repo, number)
+
+
+async def _post_pr_staleness_1month(pr: dict, member: Optional[discord.Member]) -> None:
+    repo, number, title, url = pr["repo"], pr["number"], pr["title"], pr["html_url"]
+    channel = await _channel_from_id(ANNOUNCEMENTS_CHANNEL_ID)
+    if channel is None:
+        return
+    embed = discord.Embed(
+        title="PR open over 2.5 months",
+        description=f"[#{number} in {repo}]({url})\n\n{title}",
+        color=discord.Color.red(),
+    )
+    mention = member.mention if member is not None else None
+    try:
+        await channel.send(content=mention, embed=embed)
+    except Exception:
+        logger.exception("Failed to post 1-month PR staleness notice for %s#%s", repo, number)
+
+
+def _cooldown_elapsed(last_sent_iso: Optional[str], now: datetime, cadence_days: float) -> bool:
+    if not last_sent_iso:
+        return True
+    try:
+        last_sent = datetime.fromisoformat(last_sent_iso.replace("Z", "+00:00"))
+    except ValueError:
+        return True
+    return (now - last_sent).total_seconds() / 86400.0 >= cadence_days
+
+
+async def _scan_stale_prs(guild: discord.Guild) -> None:
+    """Runs periodically over every open PR org-wide. Bot-authored and draft
+    PRs are skipped entirely -- a bot has no Discord identity, and a draft
+    isn't yet asking for review.
+
+    Three independent things happen as a PR ages:
+    - At 2 weeks: #qa-support-team gets posted once (includes assigned QA, or
+      "No QA assigned").
+    - At 2.5 weeks: the author starts getting DMed on a cadence that tightens
+      with age (weekly -> every 3 days at 3 weeks -> daily at 1 month+), not
+      just once.
+    - Also from 2.5 weeks: any requested reviewer holding the QA role who
+      hasn't reviewed yet gets the same recurring DM on the same cadence,
+      independently of whether it's their PR -- a separate DM thread from the
+      author's.
+
+    #announcements at 2.5 months is the only one-time-forever tier -- it never
+    repeats no matter how much older the PR gets.
+    """
+    if not GITHUB_ORG or not GITHUB_PAT:
+        logger.warning("PR staleness scan skipped: GITHUB_ORG or GITHUB_PAT not configured")
+        return
+    prs = await asyncio.to_thread(list_open_prs, GITHUB_ORG, GITHUB_PAT)
+    if not prs:
+        return
+
+    now = datetime.now(timezone.utc)
+    for pr in prs:
+        repo_name = (pr.get("repo") or "").split("/")[-1].strip().lower()
+        author_login = pr.get("author_login") or ""
+        if repo_name in PR_STALE_EXCLUDED_REPOS:
+            continue
+        if author_login.strip().lower() in PR_STALE_EXCLUDED_AUTHORS_PER_REPO.get(repo_name, set()):
+            continue
+        if pr.get("draft"):
+            continue
+        if author_login.endswith("[bot]"):
+            continue
+        created_at_raw = pr.get("created_at")
+        if not created_at_raw:
+            continue
+        try:
+            created_at = datetime.fromisoformat(created_at_raw.replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        age_days = (now - created_at).total_seconds() / 86400.0
+        if age_days < PR_STALE_2WEEK_DAYS:
+            continue
+
+        state = await load_pr_staleness(pr["repo"], pr["number"])
+        member = None
+        if state["resolved_discord_id"]:
+            try:
+                member = guild.get_member(int(state["resolved_discord_id"]))
+            except ValueError:
+                member = None
+        if member is None and author_login:
+            member = await _resolve_discord_member_for_github_login(author_login, guild)
+            if member is not None:
+                await save_pr_staleness(pr["repo"], pr["number"], resolved_discord_id=str(member.id))
+
+        qa_reviewers = await _resolve_pr_qa_reviewers(pr, guild)
+
+        if not state["notified_2week"]:
+            await _post_pr_staleness_qa_channel(pr, qa_reviewers)
+            await save_pr_staleness(pr["repo"], pr["number"], notified_2week=True)
+
+        if age_days >= PR_STALE_2_5WEEK_DAYS:
+            cadence = _pr_stale_dm_cadence_days(age_days)
+            if member is not None and _cooldown_elapsed(state["last_author_dm_at"], now, cadence):
+                await _dm_pr_staleness_nudge(member, pr, as_reviewer=False)
+                await save_pr_staleness(pr["repo"], pr["number"], last_author_dm_at=now.isoformat())
+
+            reviewer_dm_state = dict(state["reviewer_dm_state"])
+            reviewer_state_changed = False
+            for login, reviewer_member in qa_reviewers:
+                if await _pr_already_reviewed_by(pr, login):
+                    continue
+                if _cooldown_elapsed(reviewer_dm_state.get(login), now, cadence):
+                    await _dm_pr_staleness_nudge(reviewer_member, pr, as_reviewer=True)
+                    reviewer_dm_state[login] = now.isoformat()
+                    reviewer_state_changed = True
+            if reviewer_state_changed:
+                await save_pr_staleness(pr["repo"], pr["number"], reviewer_dm_state=reviewer_dm_state)
+
+        if age_days >= PR_STALE_ANNOUNCE_DAYS and not state["notified_1month"]:
+            # Atomically claim the one-time announcement slot before posting --
+            # two overlapping scan loops (e.g. during a Render redeploy) must
+            # never both read notified_1month=False and both post.
+            if await claim_pr_staleness_1month(pr["repo"], pr["number"]):
+                await _post_pr_staleness_1month(pr, member)
+
+
+async def _pr_staleness_scan_loop() -> None:
+    while True:
+        try:
+            guild = await _get_primary_guild()
+            if guild is not None:
+                await _scan_stale_prs(guild)
+        except Exception:
+            logger.exception("PR staleness scan iteration failed")
+        await asyncio.sleep(PR_STALE_SCAN_INTERVAL_SECONDS)
 
 
 async def _forward_announcement_to_platform(message: discord.Message) -> None:
@@ -602,6 +940,14 @@ async def _forward_announcement_to_platform(message: discord.Message) -> None:
         return
     title = format_discussion_title(resolve_discord_mentions(message, message.content or ""))
     body = format_discussion_body(message)
+    # Embed color (e.g. the PR-staleness 1-month red alert) doesn't live in
+    # message.content -- pull it off the first embed so the web page can show
+    # the same color bar Discord shows, instead of flattening everything to plain text.
+    color_hex = None
+    if message.embeds:
+        embed_color = message.embeds[0].color
+        if embed_color is not None:
+            color_hex = f"#{embed_color.value:06x}"
     payload = {
         "source": "discord",
         "discord_message_id": str(message.id),
@@ -611,6 +957,7 @@ async def _forward_announcement_to_platform(message: discord.Message) -> None:
         "title": title,
         "body": body,
         "content": message.content or "",
+        "color": color_hex,
         "timestamp": message.created_at.isoformat() if hasattr(message, "created_at") else "",
         "jump_url": getattr(message, "jump_url", ""),
     }
@@ -656,11 +1003,12 @@ def _is_staff(member: discord.Member) -> bool:
     return member.get_role(STAFF_ROLE_ID) is not None or member.guild_permissions.administrator
 
 
-def _can_dispatch_ipca_signed(member: discord.Member) -> bool:
-    """/ipca-signed grants DEV Team + Available roles on approval — restrict who can
-    even open that approval request to admins and Security & Operations Support, so a
-    member can't just self-serve the escalation path (the normal path is the automatic
-    IPCA-message detection in support tickets, not this command)."""
+def _is_staff_or_security_ops(member: discord.Member) -> bool:
+    """Shared gate for anything sensitive enough to require admins or Security &
+    Operations Support specifically -- /ipca-signed (grants DEV Team + Available
+    roles on approval) and the "kick out <name>" command (Discord kick + GitHub
+    org removal) both use this, so a plain STAFF_ROLE_ID member without the
+    security/ops role can't self-serve either escalation path."""
     if _is_staff(member):
         return True
     return IT_OPERATIONS_SUPPORT_ROLE_ID is not None and member.get_role(IT_OPERATIONS_SUPPORT_ROLE_ID) is not None
@@ -880,7 +1228,7 @@ async def handle_github_invite_request(interaction: discord.Interaction, github_
 
     # Remember mapping for future role->team sync
     try:
-        _remember_github_username(interaction.user.id, normalized_username)
+        await _remember_identity(interaction.user.id, normalized_username, interaction.user if isinstance(interaction.user, discord.Member) else None)
     except Exception:
         logger.exception(
             "Failed to remember GitHub username %s for Discord user %s",
@@ -1128,33 +1476,72 @@ def _termination_notice_text(display_name: str) -> str:
     )
 
 
-async def _send_termination_notice(target: discord.Member, github_username: Optional[str]) -> str:
-    """Resolve an email for the kicked member (self-reported at join -> GitHub
-    public email -> best-effort Plaky lookup -> Discord DM as last resort) and
-    send the termination notice. Returns a short human-readable outcome string
-    for the kick-out summary.
-    """
-    body = _termination_notice_text(target.display_name)
-    subject = "Notice of Termination — Deepiri Contributor Agreement"
+def _retirement_notice_text(display_name: str) -> str:
+    return (
+        f"Dear {display_name},\n\n"
+        "This confirms your retirement from the Deepiri project, effective immediately, "
+        "per your own request. Thank you for your contributions.\n\n"
+        "As with any departure, the following terms apply:\n"
+        "1. Cessation of Representation\n\n"
+        "Effective immediately, you may not represent yourself as:\n\n"
+        "    A current contributor to Deepiri\n\n"
+        "    Acting on behalf of Deepiri\n\n"
+        "    Affiliated with Deepiri in any ongoing capacity\n\n"
+        "You're welcome to update LinkedIn, résumés, and other public profiles to reflect "
+        "your past involvement -- any description of it must be accurate and must not imply "
+        "ongoing affiliation, authority, or endorsement.\n"
+        "2. Access and Assets\n\n"
+        "Your access to Deepiri systems, repositories, accounts, credentials, and internal "
+        "tools has been removed.\n\n"
+        "If you possess any materials that were explicitly designated as private and not "
+        "publicly released under Apache 2.0, those materials must be deleted or returned in "
+        "accordance with Sections 11 and 12 of the Deepiri Contributor and Intellectual "
+        "Property Agreement. This does not apply to publicly released open-source "
+        "repositories governed by Apache 2.0.\n"
+        "3. Continuing Obligations\n\n"
+        "All confidentiality provisions remain in effect with respect to any non-public "
+        "materials previously accessed.\n\n"
+        "Thanks again for everything you built here -- if you have questions, please submit "
+        "them in writing.\n\n"
+        "Sincerely,\n"
+        "Deepiri Management"
+    )
 
-    email = await load_member_email(target.id)
-    github_real_name = None
+
+async def _send_offboarding_notice(
+    target: discord.Member, github_username: Optional[str], *, subject: str, body: str
+) -> str:
+    """Resolve an email for the departing member (self-reported at join -> GitHub
+    public email -> best-effort Plaky lookup -> Discord DM as last resort) and
+    send the given notice. Returns a short human-readable outcome string for the
+    calling flow's summary. Shared by both the involuntary kick-out path
+    (termination notice) and the voluntary retirement path (retirement notice)."""
+    # Check the dynamic identity cache first -- if this person ever self-reported
+    # a GitHub link, their real name was captured then, independent of whether
+    # github_username (resolved just now, possibly from a stylized handle that
+    # doesn't fuzzy-match anything) resolves at all this time.
+    cached_profile = await load_member_profile(target.id)
+    email = cached_profile["email"]
+    github_real_name = cached_profile["real_name"]
+    if not github_username:
+        github_username = cached_profile["github_username"]
+
     if not email and github_username:
         profile = await asyncio.to_thread(get_user_profile, github_username, GITHUB_PAT)
         email = profile.get("email")
-        github_real_name = profile.get("name")
+        github_real_name = github_real_name or profile.get("name")
         if not email:
             logger.info("Termination notice: no public GitHub email for %s (real name on profile: %r)", github_username, github_real_name)
     if not email and not PLAKY_API_KEY:
         logger.warning("Termination notice: PLAKY_API_KEY not configured, skipping Plaky lookup for %s", target.id)
     if not email and PLAKY_API_KEY:
         # Throw every known identifier at Plaky at once instead of trying one
-        # candidate and giving up: GitHub's real display name (e.g. login
-        # "riccorx" -> name "Ricardo Beale" -- the person's own self-reported
-        # real name, a far stronger signal than any account handle), the GitHub
-        # login itself, and every Discord identifier. find_user_email picks the
-        # single best-scoring match across all of them, not just the first
-        # candidate that happens to clear the threshold.
+        # candidate and giving up: the cached/fetched real display name (e.g.
+        # login "riccorx" -> name "Ricardo Beale" -- the person's own
+        # self-reported real name, a far stronger signal than any account
+        # handle), the GitHub login itself, and every Discord identifier.
+        # find_user_email picks the single best-scoring match across all of
+        # them, not just the first candidate that happens to clear the threshold.
         candidates = [
             github_real_name,
             github_username,
@@ -1165,18 +1552,44 @@ async def _send_termination_notice(target: discord.Member, github_username: Opti
         logger.info("Termination notice: trying Plaky lookup for %s with candidates %s", target.id, candidates)
         email = await asyncio.to_thread(find_user_email, candidates, PLAKY_API_KEY)
 
+    email_fail_reason = None
     if email:
-        sent = await asyncio.to_thread(send_email, email, subject, body)
+        sent, email_fail_reason = await asyncio.to_thread(send_email, email, subject, body)
         if sent:
             return f"emailed to {email}"
-        logger.warning("Termination email to %s failed to send; falling back to DM for %s", email, target.id)
+        logger.warning("Termination email to %s failed to send (%s); falling back to DM for %s", email, email_fail_reason, target.id)
+        # A credentials failure isn't specific to this one person -- it silently
+        # breaks every future termination/retirement email until someone fixes
+        # SMTP_PASSWORD, so this deserves a channel alert now rather than only
+        # a per-kick "failed" note that's easy to shrug off as a one-off.
+        if email_fail_reason and "credentials" in email_fail_reason.lower() and STAFF_CHANNEL_ID:
+            alert_channel = await _channel_from_id(STAFF_CHANNEL_ID)
+            if alert_channel is not None:
+                try:
+                    await alert_channel.send(
+                        f"⚠️ Offboarding email to {email} failed: {email_fail_reason}. "
+                        "This will keep failing for every future kick-out/retirement until SMTP_PASSWORD is refreshed."
+                    )
+                except Exception:
+                    logger.exception("Failed to post SMTP credentials alert to #it-notifications")
 
     try:
         await target.send(f"**{subject}**\n\n{body}")
-        return "no email found — sent via Discord DM" if not email else "email send failed — sent via Discord DM instead"
+        if not email:
+            return "no email found — sent via Discord DM"
+        return f"email send failed ({email_fail_reason}) — sent via Discord DM instead"
     except Exception:
         logger.exception("Failed to DM termination notice to %s", target.id)
         return "could not deliver notice via email or DM"
+
+
+async def _send_termination_notice(target: discord.Member, github_username: Optional[str]) -> str:
+    return await _send_offboarding_notice(
+        target,
+        github_username,
+        subject="Notice of Termination — Deepiri Contributor Agreement",
+        body=_termination_notice_text(target.display_name),
+    )
 
 
 def _candidate_roles_by_category(guild: discord.Guild) -> "dict[str, discord.Role]":
@@ -1238,7 +1651,17 @@ async def _maybe_handle_onboarding_dm(message: discord.Message) -> bool:
     # contains "github.com" too, which is exactly the pattern CodeQL flags.)
     github_username = _extract_github_profile_username(content) if URL_RE.search(content) else None
     if github_username:
-        _remember_github_username(message.author.id, github_username)
+        # _remember_identity captures their real name right now too, while
+        # it's a certain, self-reported signal -- not a fuzzy guess later.
+        # This is the dynamic alias table: no one hand-types a nickname
+        # mapping, it's recorded the moment it's known, so a kick-out for a
+        # stylized handle months later is a cache hit on the real name
+        # instead of a string-similarity gamble on the handle itself. Same
+        # helper also runs from every other place a GitHub username gets
+        # resolved (org-roster fuzzy match, #github-profiles scan, PR-staleness
+        # reverse lookup), so this fills in for members who joined before it
+        # existed too, not just fresh onboarding.
+        await _remember_identity(message.author.id, github_username, message.author)
         await message.channel.send(f"Got it — linked your GitHub as **{github_username}**.")
         return True
 
@@ -1320,6 +1743,95 @@ async def _resolve_reply_channel(message: discord.Message):
     return message.channel
 
 
+async def _close_ticket_thread(channel) -> None:
+    """Closes a resolved support-ticket thread via Discord's own archive API.
+
+    Confirmed correct via "probe needle" against a real ticket: Needle's own
+    ticket-panel message has an "Archive thread" button (custom_id="close",
+    ButtonStyle.success) -- there's no separate Needle-internal close
+    mechanism to reverse-engineer, that button's whole job is exactly the
+    Discord archive call this makes. (A "/close" text command, tried
+    earlier, was never it -- Discord slash commands only fire through a real
+    user interaction, and there's no supported way for one bot to invoke
+    another bot's slash command or press a button on another bot's message.)
+
+    Archiving does hide the thread from the sidebar unless "Archived
+    Threads" is expanded -- that's expected once a ticket is actually
+    closed, the same as clicking Needle's own button would do, not a bug.
+    """
+    if not isinstance(channel, discord.Thread):
+        return
+    try:
+        await channel.edit(archived=True, locked=False, reason="Ticket resolved")
+    except discord.Forbidden:
+        logger.error("No permission to archive ticket thread %s (check Manage Threads)", channel.id)
+    except Exception:
+        logger.exception("Failed to archive ticket thread %s", channel.id)
+
+
+PROBE_NEEDLE_COMMAND_RE = re.compile(r"^\s*probe\s+needle\s*$", re.IGNORECASE)
+
+
+async def _maybe_handle_probe_needle_command(message: discord.Message) -> bool:
+    """Staff-only diagnostic: "probe needle" typed in a ticket thread dumps
+    every bot-authored message in that thread -- content, embed titles/
+    descriptions/fields, and every button/select component's label + style +
+    custom_id -- to whoever ran it, via DM. This is how to actually find out
+    what Needle expects to close a ticket (a button on its own ticket-panel
+    message, a reaction, particular text, ...) instead of guessing again:
+    real observed data from Needle's own posts, not another assumption.
+    """
+    if message.guild is None or not isinstance(message.channel, discord.Thread):
+        return False
+    if not PROBE_NEEDLE_COMMAND_RE.match(message.content or ""):
+        return False
+    if not isinstance(message.author, discord.Member) or not _is_staff_or_security_ops(message.author):
+        return False
+
+    thread = message.channel
+    lines = [f"**Needle probe -- #{thread.name} ({thread.id})**\n"]
+    found_any = False
+    try:
+        async for msg in thread.history(limit=200, oldest_first=True):
+            if not msg.author.bot:
+                continue
+            found_any = True
+            lines.append(f"--- message {msg.id} by {msg.author} ({msg.author.id}) ---")
+            if msg.content:
+                lines.append(f"content: {msg.content[:500]!r}")
+            for embed in msg.embeds:
+                lines.append(f"embed: title={embed.title!r} description={(embed.description or '')[:300]!r}")
+                for field in embed.fields:
+                    lines.append(f"  field: name={field.name!r} value={(field.value or '')[:200]!r}")
+            for row in msg.components:
+                for child in getattr(row, "children", []):
+                    lines.append(
+                        f"component: type={type(child).__name__} label={getattr(child, 'label', None)!r} "
+                        f"style={getattr(child, 'style', None)!r} custom_id={getattr(child, 'custom_id', None)!r} "
+                        f"url={getattr(child, 'url', None)!r}"
+                    )
+            reactions = [(str(r.emoji), r.count) for r in msg.reactions]
+            if reactions:
+                lines.append(f"reactions: {reactions}")
+    except Exception:
+        logger.exception("Failed to probe ticket thread %s for Needle diagnostics", thread.id)
+        lines.append("(error scanning thread history -- see Norozo logs)")
+
+    if not found_any:
+        lines.append("(no bot-authored messages found in this thread)")
+
+    dump = "\n".join(lines)
+    try:
+        for chunk_start in range(0, len(dump), 1900):
+            await message.author.send(f"```\n{dump[chunk_start:chunk_start + 1900]}\n```")
+    except discord.Forbidden:
+        await thread.send(f"{message.author.mention} Couldn't DM you the probe results -- check your DM settings.")
+        return True
+
+    await thread.send(f"{message.author.mention} Sent you the Needle probe results via DM.")
+    return True
+
+
 async def _maybe_handle_kick_out_command(message: discord.Message) -> bool:
     """Staff saying 'kick out <name>' (or 'kick <name>') in #support-tickets,
     #admin-terminal, or #it-kick-list removes the member from Discord AND the
@@ -1330,7 +1842,7 @@ async def _maybe_handle_kick_out_command(message: discord.Message) -> bool:
     match = KICK_OUT_COMMAND_RE.match(message.content or "")
     if not match:
         return False
-    if not isinstance(message.author, discord.Member) or not _is_staff(message.author):
+    if not isinstance(message.author, discord.Member) or not _is_staff_or_security_ops(message.author):
         return False
 
     target = _resolve_kick_target(message, match.group(1))
@@ -1397,18 +1909,153 @@ async def _maybe_handle_kick_out_command(message: discord.Message) -> bool:
             except Exception:
                 pass
 
-    # Same as IPCA's resolve-and-archive: the kick-out ticket is now handled,
+    # Same as IPCA's resolve-and-close: the kick-out ticket is now handled,
     # close it out the way a human staffer would rather than leaving it open.
-    if isinstance(summary_channel, discord.Thread):
-        try:
-            await summary_channel.edit(archived=True, locked=False, reason="Kick-out resolved")
-        except Exception:
-            logger.exception("Failed to archive kick-out ticket thread %s", summary_channel.id)
+    await _close_ticket_thread(summary_channel)
+    return True
+
+
+async def _execute_retirement(target: discord.Member, guild: discord.Guild) -> str:
+    """Same underlying offboarding as kick-out (Discord kick + GitHub org
+    removal + notice), but framed as a voluntary retirement rather than a
+    termination. Returns a human-readable summary."""
+    github_username = _get_github_username_for_member(target)
+    if github_username and not await asyncio.to_thread(is_org_member, github_username, GITHUB_ORG, GITHUB_PAT):
+        github_username = None
+    if not github_username:
+        github_username = await _find_github_username_in_profiles_channel(target)
+    if not github_username:
+        github_username = await _find_github_username_via_org_roster(target)
+
+    notice_outcome = await _send_offboarding_notice(
+        target,
+        github_username,
+        subject="Retirement Confirmation — Deepiri",
+        body=_retirement_notice_text(target.display_name),
+    )
+
+    discord_ok = True
+    try:
+        await target.kick(reason=f"Voluntary retirement, confirmed by {target}")
+    except Exception:
+        discord_ok = False
+        logger.exception("Failed to kick retiring member %s", target.id)
+
+    github_ok = False
+    github_note = "no mapped GitHub username, skipped"
+    if github_username:
+        org_result = remove_user_from_org(username=github_username, github_org=GITHUB_ORG, github_pat=GITHUB_PAT)
+        github_ok = bool(org_result.get("ok"))
+        github_note = github_username if github_ok else f"{github_username} — {org_result.get('message')}"
+
+    return (
+        f"{'✅' if discord_ok else '⚠️'} Discord kick: {target} ({target.id})\n"
+        f"{'✅' if github_ok else '⚠️'} GitHub org removal: {github_note}\n"
+        f"📧 Retirement notice: {notice_outcome}"
+    )
+
+
+class RetirementConfirmView(discord.ui.View):
+    """Sent as a DM to the person named as retiring -- only they can confirm,
+    so a staff member naming someone else in chat can't force it through
+    without that person's own say-so."""
+
+    def __init__(self, target_id: int, origin_channel_id: Optional[int]):
+        super().__init__(timeout=24 * 60 * 60)
+        self.target_id = target_id
+        self.origin_channel_id = origin_channel_id
+
+    async def _disable(self, interaction: discord.Interaction) -> None:
+        for item in self.children:
+            item.disabled = True  # type: ignore[attr-defined]
+        if interaction.message:
+            try:
+                await interaction.message.edit(view=self)
+            except Exception:
+                pass
+
+    @discord.ui.button(label="Confirm Retirement", style=discord.ButtonStyle.danger, custom_id="retirement_confirm")
+    async def confirm(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        if interaction.user is None or interaction.user.id != self.target_id:
+            await interaction.response.send_message("This confirmation isn't yours to click.", ephemeral=True)
+            return
+
+        await interaction.response.defer()
+        await self._disable(interaction)
+
+        guild = await _get_primary_guild()
+        member = guild.get_member(self.target_id) if guild else None
+        if member is None:
+            await interaction.followup.send("Couldn't find you in the server anymore -- nothing to do.")
+            return
+
+        summary = await _execute_retirement(member, guild)
+        await interaction.followup.send(f"Retirement confirmed. {summary}")
+
+        if self.origin_channel_id:
+            origin_channel = await _channel_from_id(self.origin_channel_id)
+            if origin_channel is not None:
+                try:
+                    await origin_channel.send(f"{member} confirmed their retirement.\n{summary}")
+                except Exception:
+                    logger.exception("Failed to post retirement summary to origin channel %s", self.origin_channel_id)
+                await _close_ticket_thread(origin_channel)
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary, custom_id="retirement_cancel")
+    async def cancel(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        if interaction.user is None or interaction.user.id != self.target_id:
+            await interaction.response.send_message("This confirmation isn't yours to click.", ephemeral=True)
+            return
+        await interaction.response.send_message("No changes made.")
+        await self._disable(interaction)
+
+
+def _resolve_retirement_target(message: discord.Message) -> Optional[discord.Member]:
+    """@mention in the message wins; otherwise falls back to the current
+    ticket thread's creator (the member who opened it)."""
+    for mentioned in message.mentions:
+        if isinstance(mentioned, discord.Member) and not mentioned.bot:
+            return mentioned
+    if isinstance(message.channel, discord.Thread) and message.channel.owner_id:
+        guild = message.guild
+        if guild is not None:
+            owner = guild.get_member(message.channel.owner_id)
+            if owner is not None and not owner.bot:
+                return owner
+    return None
+
+
+async def _maybe_handle_retirement_announcement(message: discord.Message) -> bool:
+    """Staff saying "<@member> is retiring" / "is leaving Deepiri" (or just
+    "retiring"/"leaving deepiri" in a ticket thread, falling back to the
+    ticket creator) posts a confirmation prompt directly in that ticket
+    thread -- only the named person can confirm, at which point it's the
+    same offboarding as kick-out (Discord kick + GitHub org removal), framed
+    as a retirement rather than a termination."""
+    if message.guild is None or not RETIRING_TRIGGER_RE.search(message.content or ""):
+        return False
+    if not isinstance(message.author, discord.Member) or not _is_staff_or_security_ops(message.author):
+        return False
+
+    target = _resolve_retirement_target(message)
+    reply_channel = await _resolve_reply_channel(message)
+    if target is None:
+        await reply_channel.send(
+            f"{message.author.mention} Couldn't tell who's retiring -- @ mention them, or say it in their ticket thread."
+        )
+        return True
+
+    view = RetirementConfirmView(target_id=target.id, origin_channel_id=reply_channel.id)
+    await reply_channel.send(
+        f"{target.mention} **Are you sure you want to retire from Deepiri?** "
+        "Click below to confirm -- this will remove your Discord access and GitHub org membership.",
+        view=view,
+    )
     return True
 
 
 async def handle_ipca_signed(interaction: discord.Interaction, github_username: str) -> None:
-    if not isinstance(interaction.user, discord.Member) or not _can_dispatch_ipca_signed(interaction.user):
+    if not isinstance(interaction.user, discord.Member) or not _is_staff_or_security_ops(interaction.user):
         await interaction.response.send_message(
             "Only Admins or Security & Operations Support can run this command. "
             "Roles are normally granted automatically when you sign the IPCA in your support ticket.",
@@ -1436,7 +2083,7 @@ async def handle_ipca_signed(interaction: discord.Interaction, github_username: 
     normalized = _extract_github_profile_username(github_username) if github_username else None
     if normalized:
         try:
-            _remember_github_username(interaction.user.id, normalized)
+            await _remember_identity(interaction.user.id, normalized, interaction.user if isinstance(interaction.user, discord.Member) else None)
         except Exception:
             logger.exception(
                 "Failed to remember GitHub username %s for Discord user %s",
@@ -1909,8 +2556,13 @@ async def platform_alert_handler(request: web.Request) -> web.Response:
     embed.add_field(name="How to handle", value=steps[:1024], inline=False)
     embed.set_footer(text=f"{service} • {severity.upper()}")
 
+    # Critical/urgent alerts @ the Security & Operations Support role directly in
+    # the channel post (not just the individual DMs below) so it's visible to
+    # anyone watching #it-notifications, not only the people who got DMed.
+    role_mention = f"<@&{IT_OPERATIONS_SUPPORT_ROLE_ID}>" if severity == "critical" and IT_OPERATIONS_SUPPORT_ROLE_ID is not None else None
+
     try:
-        await channel.send(embed=embed)
+        await channel.send(content=role_mention, embed=embed)
     except Exception:
         logger.exception("Failed to post platform alert to Discord")
         return web.json_response({"ok": False, "message": "Failed to post to Discord"}, status=500)
@@ -1933,6 +2585,68 @@ async def health_handler(_: web.Request) -> web.Response:
     )
 
 
+async def test_email_debug_handler(request: web.Request) -> web.Response:
+    """Debug-only: exercises the exact same identity-resolution + email-send
+    path as kick-out/retirement (_send_offboarding_notice), for one Discord
+    member, WITHOUT kicking them from Discord or removing them from the
+    GitHub org. Signed the same way as the other inbound webhooks so this
+    can't be hit by anyone who doesn't already have the shared secret.
+    """
+    raw_body = await request.read()
+    if not ANNOUNCEMENTS_INBOUND_SECRET:
+        return web.json_response({"ok": False, "message": "Webhook authentication is not configured"}, status=503)
+    sig_header = request.headers.get("X-Norozo-Signature") or request.headers.get("X-Platform-Signature") or ""
+    if not sig_header or not _is_valid_announcement_signature(raw_body, sig_header, ANNOUNCEMENTS_INBOUND_SECRET):
+        return web.json_response({"ok": False, "message": "Missing or invalid signature"}, status=401)
+
+    try:
+        payload = json.loads(raw_body.decode("utf-8"))
+    except Exception:
+        return web.json_response({"ok": False, "message": "Invalid JSON"}, status=400)
+
+    discord_id_raw = payload.get("discord_id")
+    if not discord_id_raw:
+        return web.json_response({"ok": False, "message": "discord_id is required"}, status=400)
+    try:
+        discord_id = int(discord_id_raw)
+    except ValueError:
+        return web.json_response({"ok": False, "message": "discord_id must be numeric"}, status=400)
+
+    guild = await _get_primary_guild()
+    if guild is None:
+        return web.json_response({"ok": False, "message": "Could not resolve the primary guild"}, status=500)
+
+    member = guild.get_member(discord_id)
+    if member is None:
+        try:
+            member = await guild.fetch_member(discord_id)
+        except discord.NotFound:
+            member = None
+    if member is None:
+        return web.json_response({"ok": False, "message": f"No member {discord_id} found in guild"}, status=404)
+
+    github_username = _get_github_username_for_member(member)
+    if github_username and GITHUB_ORG and GITHUB_PAT and not await asyncio.to_thread(is_org_member, github_username, GITHUB_ORG, GITHUB_PAT):
+        github_username = None
+    if not github_username:
+        github_username = await _find_github_username_in_profiles_channel(member)
+    if not github_username:
+        github_username = await _find_github_username_via_org_roster(member)
+
+    outcome = await _send_offboarding_notice(
+        member,
+        github_username,
+        subject="Norozo Test Email",
+        body=(
+            f"Hi {member.display_name},\n\n"
+            "This is a test email from Norozo to confirm SMTP delivery is working. "
+            "No action needed -- you have not been removed from Discord or GitHub.\n\n"
+            "-- Deepiri"
+        ),
+    )
+    return web.json_response({"ok": True, "discord_id": discord_id, "github_username": github_username, "outcome": outcome})
+
+
 async def start_webhook_server() -> None:
     app = web.Application()
     app.router.add_get("/health", health_handler)
@@ -1942,6 +2656,7 @@ async def start_webhook_server() -> None:
     app.router.add_post("/webhooks/platform-announcements", platform_announcement_handler)
     app.router.add_post("/alerts/webhook", platform_alert_handler)
     app.router.add_post("/webhooks/platform-alerts", platform_alert_handler)
+    app.router.add_post("/debug/test-email", test_email_debug_handler)
 
     runner = web.AppRunner(app)
     await runner.setup()
@@ -1992,6 +2707,7 @@ def _create_and_register_bot() -> DeepiriBot:
             logger.exception("Failed to start meeting loop")
         asyncio.create_task(_catch_up_since_last_online(new_bot))
         asyncio.create_task(_heartbeat_last_online())
+        asyncio.create_task(_pr_staleness_scan_loop())
 
     @new_bot.event  # type: ignore[attr-defined]
     async def on_member_join(member: discord.Member) -> None:  # type: ignore[no-redef]
@@ -2064,7 +2780,13 @@ def _create_and_register_bot() -> DeepiriBot:
             return
         content = message.content or ""
         await notify_support_team_for_message(message)
+        if await _maybe_handle_probe_needle_command(message):
+            await new_bot.process_commands(message)
+            return
         if await _maybe_handle_kick_out_command(message):
+            await new_bot.process_commands(message)
+            return
+        if await _maybe_handle_retirement_announcement(message):
             await new_bot.process_commands(message)
             return
         await _maybe_auto_assign_ipca_roles(message)

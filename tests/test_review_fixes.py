@@ -85,11 +85,11 @@ async def test_maybe_auto_assign_ipca_roles_assigns_when_missing(monkeypatch):
     message.add_reaction.assert_awaited_once_with("✅")
     # support-tickets auto-thread: confirmation must land in the companion
     # thread (message.thread), not back in the parent channel via reply().
-    thread.send.assert_awaited_once()
-    assert "We gave you access to the rest of the Discord." in thread.send.call_args.args[0]
+    assert "We gave you access to the rest of the Discord." in thread.send.call_args_list[0].args[0]
     channel.send.assert_not_awaited()
-    # Ticket resolved -> the companion thread gets archived (closed).
-    thread.edit.assert_awaited_once_with(archived=True, locked=False, reason="IPCA signed — ticket resolved")
+    # Ticket resolved -> the companion thread gets archived (closed), same as
+    # Needle's own "Archive thread" button would do.
+    thread.edit.assert_awaited_once_with(archived=True, locked=False, reason="Ticket resolved")
 
 
 @pytest.mark.asyncio
@@ -159,8 +159,7 @@ async def test_maybe_auto_assign_ipca_roles_archives_current_thread_when_message
     assigned = await main._maybe_auto_assign_ipca_roles(message)
 
     assert assigned is True
-    thread_channel.send.assert_awaited_once()
-    thread_channel.edit.assert_awaited_once_with(archived=True, locked=False, reason="IPCA signed — ticket resolved")
+    thread_channel.edit.assert_awaited_once_with(archived=True, locked=False, reason="Ticket resolved")
 
 
 @pytest.mark.asyncio
@@ -285,11 +284,53 @@ async def test_announcement_forward_uses_async_client_and_signed_bytes(monkeypat
         content="Announcement",
         created_at=datetime.now(timezone.utc),
         jump_url="https://discord.example/message/123",
+        embeds=[],
     )
 
     await main._forward_announcement_to_platform(message)
 
     post.assert_awaited_once()
+    payload = json.loads(post.await_args.kwargs["content"])
+    assert payload["color"] is None
+
+
+@pytest.mark.asyncio
+async def test_announcement_forward_includes_embed_color(monkeypatch):
+    """A bot-posted embed (e.g. the 1-month PR-staleness red alert) should carry
+    its color through to the platform page, not get flattened to plain text."""
+    response = SimpleNamespace(raise_for_status=Mock())
+    post = AsyncMock(return_value=response)
+
+    class FakeAsyncClient:
+        def __init__(self, *, timeout):
+            pass
+
+        async def __aenter__(self):
+            return SimpleNamespace(post=post)
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+    monkeypatch.setattr(main.httpx, "AsyncClient", FakeAsyncClient)
+    monkeypatch.setattr(main, "PLATFORM_ANNOUNCEMENTS_WEBHOOK_URL", "https://platform.example/webhook")
+    monkeypatch.setattr(main, "PLATFORM_ANNOUNCEMENTS_SECRET", "bridge-secret")
+    monkeypatch.setattr(main, "format_discussion_title", lambda content: "Title")
+    monkeypatch.setattr(main, "format_discussion_body", lambda message: "Body")
+    embed = SimpleNamespace(color=discord.Color.red())
+    message = SimpleNamespace(
+        id=124,
+        channel=SimpleNamespace(id=456),
+        author=SimpleNamespace(id=789, __str__=lambda self: "Author"),
+        content="Announcement",
+        created_at=datetime.now(timezone.utc),
+        jump_url="https://discord.example/message/124",
+        embeds=[embed],
+    )
+
+    await main._forward_announcement_to_platform(message)
+
+    payload = json.loads(post.await_args.kwargs["content"])
+    assert payload["color"] == f"#{discord.Color.red().value:06x}"
     request = post.await_args
     raw = request.kwargs["content"]
     expected_signature = _signature(raw, "bridge-secret")

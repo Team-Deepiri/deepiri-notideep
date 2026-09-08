@@ -90,24 +90,48 @@ def _score_one(query: str, candidate: str) -> tuple:
     if len(q) >= 2 and q in v_tokens:
         return 0.93, f"first-name match in {candidate!r}"
 
-    if multi_token and all(
-        any(t == vt or (len(t) == 1 and vt.startswith(t)) or (len(vt) == 1 and t.startswith(vt)) for vt in v_tokens)
-        for t in q_tokens
-    ):
+    # Exact token match only -- no longer accepts a bare initial ("H") as
+    # standing in for any full token starting with that letter ("Hauer",
+    # "Harrison", "Henderson", ...). That shortcut was a real false-positive
+    # incident: "Joe Black" (github_real_name candidate) vs a Plaky roster
+    # entry shaped like "Joe H<something>" scored 0.9 -- confident-looking,
+    # but a bare initial is compatible with dozens of unrelated surnames in
+    # any real-size roster, and best_match's ambiguity check only catches the
+    # collision when a second same-shaped candidate happens to also be
+    # present, not when it's the only person with that first name + initial.
+    # An abbreviated "Firstname L." query still gets a chance via the
+    # whole-string ratio comparison below (gated at 0.82), which is far more
+    # conservative since it also weighs the overall length difference.
+    if multi_token and all(t in v_tokens for t in q_tokens):
         return 0.9, f"all parts of {query!r} match {candidate!r}"
 
     if not multi_token:
         containment = _containment_score(q, v)
         if containment > 0:
             return containment, f"{q!r} fully contained in {candidate!r}"
-        ratio = _similar(q, v)
-        if ratio >= 0.5:
-            return ratio, f"{int(ratio * 100)}% similar to {candidate!r}"
+        # 0.82, not 0.5: comparing a single bare token against a whole
+        # "First Last"-shaped candidate is exactly the same shape of risk as
+        # the multi-token full-name-typo case below (e.g. "Matthew" vs "Mateo
+        # Sevilla" scores 0.667 on raw ratio -- two different people who
+        # happen to share a couple of letters), so it gets the same guard
+        # rather than a laxer one just because fewer tokens were supplied.
+        # len(q) >= 4: below this, ratio/edit-distance stops being a usable
+        # signal at all -- "erik"/"eric" (same person, real typo) and
+        # "kyle"/"kyla" (different people) score *identically* on ratio,
+        # matched-char count, and edit distance (0.75 / 3 / 1, every one).
+        # No threshold here can tell them apart, so a query this short must
+        # go through the token loop's own guard (or another signal) instead
+        # of this whole-candidate check -- matching the length floor already
+        # applied there, which this check was inconsistently missing.
+        if len(q) >= 4:
+            ratio = _similar(q, v)
+            if ratio >= 0.82:
+                return ratio, f"{int(ratio * 100)}% similar to {candidate!r}"
         for token in v_tokens:
             if len(token) < 4 or len(q) < 4:
                 continue
             tok_ratio = _similar(q, token) * 0.97
-            if tok_ratio >= 0.5:
+            if tok_ratio >= 0.82:
                 return tok_ratio, f"close to {token!r} in {candidate!r}"
     else:
         # Full "First Last"-shaped typo (e.g. "Jordan Runyan" -> "Jordan Runyon").
