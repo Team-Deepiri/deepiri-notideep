@@ -134,12 +134,17 @@ def test_dm_cadence_tightens_with_age():
     assert main._pr_stale_dm_cadence_days(90) == 1
 
 
-def _scan_common_mocks(monkeypatch, pr, *, member=None, qa_reviewers=None):
+def _scan_common_mocks(monkeypatch, pr, *, member=None, qa_reviewers=None, raw_qa_logins=None, qa_identity_map=None):
+    qa_reviewers = qa_reviewers or []
+    if raw_qa_logins is None:
+        raw_qa_logins = [login for login, _member in qa_reviewers]
+    if qa_identity_map is None:
+        qa_identity_map = {login: member for login, member in qa_reviewers}
     monkeypatch.setattr(main, "GITHUB_ORG", "Team-Deepiri")
     monkeypatch.setattr(main, "GITHUB_PAT", "fake")
     monkeypatch.setattr(main, "list_open_prs", lambda org, pat: [pr])
     monkeypatch.setattr(main, "_resolve_discord_member_for_github_login", AsyncMock(return_value=member))
-    monkeypatch.setattr(main, "_resolve_pr_qa_reviewers", AsyncMock(return_value=qa_reviewers or []))
+    monkeypatch.setattr(main, "_resolve_pr_qa_reviewers", AsyncMock(return_value=(raw_qa_logins, qa_identity_map, qa_reviewers)))
     monkeypatch.setattr(main, "_pr_already_reviewed_by", AsyncMock(return_value=False))
 
 
@@ -156,7 +161,7 @@ async def test_2week_qa_channel_fires_once_with_no_qa_assigned(monkeypatch):
 
     await main._scan_stale_prs(SimpleNamespace(get_member=lambda uid: None))
 
-    qa_post.assert_awaited_once_with(pr, [])
+    qa_post.assert_awaited_once_with(pr, [], {})
     assert saved_state[(pr["repo"], pr["number"])]["notified_2week"] is True
 
     qa_post.reset_mock()
@@ -178,7 +183,7 @@ async def test_2week_qa_channel_includes_assigned_qa(monkeypatch):
 
     await main._scan_stale_prs(SimpleNamespace(get_member=lambda uid: None))
 
-    qa_post.assert_awaited_once_with(pr, [("qalogin", qa_member)])
+    qa_post.assert_awaited_once_with(pr, ["qalogin"], {"qalogin": qa_member})
 
 
 @pytest.mark.asyncio
@@ -392,7 +397,7 @@ async def test_scan_skips_jrb00013_in_diva_only(monkeypatch):
     monkeypatch.setattr(main, "list_open_prs", lambda org, pat: [excluded, other_author_in_diva, jrb_in_other_repo])
     monkeypatch.setattr(main, "load_pr_staleness", AsyncMock(return_value=_default_state()))
     monkeypatch.setattr(main, "_resolve_discord_member_for_github_login", AsyncMock(return_value=None))
-    monkeypatch.setattr(main, "_resolve_pr_qa_reviewers", AsyncMock(return_value=[]))
+    monkeypatch.setattr(main, "_resolve_pr_qa_reviewers", AsyncMock(return_value=([], {}, [])))
     qa_post = AsyncMock()
     monkeypatch.setattr(main, "_post_pr_staleness_qa_channel", qa_post)
 
@@ -439,9 +444,55 @@ async def test_resolve_pr_qa_reviewers_filters_by_role(monkeypatch):
     monkeypatch.setattr(main, "_resolve_discord_member_for_github_login", fake_resolve)
 
     pr = _pr()
-    result = await main._resolve_pr_qa_reviewers(pr, SimpleNamespace())
+    raw_logins, identity_map, qa_role_pairs = await main._resolve_pr_qa_reviewers(pr, SimpleNamespace())
 
-    assert result == [("qaguy", qa_member)]
+    assert raw_logins == ["qaguy", "randomguy"]
+    # Both resolve to a Discord identity via the matching chain (no hardcoding) --
+    # only the QA-role-holding one lands in qa_role_pairs (used for DM nudges).
+    assert identity_map == {"qaguy": qa_member, "randomguy": non_qa_member}
+    assert qa_role_pairs == [("qaguy", qa_member)]
+
+
+@pytest.mark.asyncio
+async def test_qa_channel_shows_github_reviewer_even_when_discord_role_unsynced(monkeypatch):
+    """Regression: a PR with a GitHub-requested reviewer whose Discord identity
+    resolves (via the existing GitHub->Discord matching chain) but whose QA
+    role hasn't synced must still show as assigned -- mentioning the resolved
+    Discord member -- rather than "No QA assigned"; the post should never
+    disagree with what GitHub itself reports."""
+    reviewer_member = _member(id_=42, display_name="Satvik")
+    pr = _pr(days_old=15)
+    _scan_common_mocks(
+        monkeypatch, pr, qa_reviewers=[], raw_qa_logins=["satvik"],
+        qa_identity_map={"satvik": reviewer_member},
+    )
+    _, fake_load, fake_save = _make_state_store()
+    monkeypatch.setattr(main, "load_pr_staleness", fake_load)
+    monkeypatch.setattr(main, "save_pr_staleness", fake_save)
+    qa_post = AsyncMock()
+    monkeypatch.setattr(main, "_post_pr_staleness_qa_channel", qa_post)
+    monkeypatch.setattr(main, "_dm_pr_staleness_nudge", AsyncMock())
+
+    await main._scan_stale_prs(SimpleNamespace(get_member=lambda uid: None))
+
+    qa_post.assert_awaited_once_with(pr, ["satvik"], {"satvik": reviewer_member})
+
+
+@pytest.mark.asyncio
+async def test_qa_channel_falls_back_to_bare_github_username_when_unresolved(monkeypatch):
+    """No hardcoded username mapping exists, so when the GitHub->Discord
+    identity chain finds nobody for a requested reviewer, the post must fall
+    back to the bare GitHub login -- never silently drop them into "No QA
+    assigned", and never fabricate a mention."""
+    channel = SimpleNamespace(send=AsyncMock())
+    monkeypatch.setattr(main, "_channel_from_id", AsyncMock(return_value=channel))
+    pr = _pr()
+
+    await main._post_pr_staleness_qa_channel(pr, ["satvik"], {})
+
+    sent_text = channel.send.await_args.args[0]
+    assert "satvik" in sent_text
+    assert "No QA assigned" not in sent_text
 
 
 @pytest.mark.asyncio

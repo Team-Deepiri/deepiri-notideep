@@ -9,7 +9,7 @@ import re
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Dict, Optional
 from urllib.parse import urlparse
 
 import discord
@@ -29,7 +29,8 @@ from onboarding import ApprovalView
 from member_email_store import load_member_email, load_member_profile, save_member_email, save_member_real_name
 from pr_staleness_store import claim_pr_staleness_1month, find_discord_id_by_email, load_pr_staleness, save_pr_staleness
 from plaky import create_task, find_user_email, get_tasks
-from state_store import load_last_online_at, save_last_online_at
+from security_assessment import overall_status, render_digest_lines, render_indepth_report, run_full_assessment
+from state_store import load_last_online_at, load_state, save_last_online_at, save_state
 
 
 load_dotenv()
@@ -118,6 +119,19 @@ PR_STALE_3WEEK_DAYS = 21
 PR_STALE_DM_DAILY_DAYS = 30  # 1 month+ -> DM cadence tightens to daily
 PR_STALE_ANNOUNCE_DAYS = 75  # 2.5 months -> one-time public #announcements post
 PR_STALE_SCAN_INTERVAL_SECONDS = 6 * 60 * 60  # 6 hours -- PR age changes slowly
+
+# Routine security-posture checks (GitHub access/alerts, Discord admins, Plaky
+# access, Deepiri.com, email SPF/DMARC, Deepiri Cloud): a short digest posts to
+# #it-notifications twice a week, and every IT_OPERATIONS_SUPPORT_ROLE_ID member
+# gets the same digest DMed once a week regardless of whether anyone ran the
+# in-depth command -- manual routine checks stay a requirement, this just makes
+# sure nobody has to remember to look.
+SECURITY_ASSESSMENT_WEBSITE_URL = os.getenv("SECURITY_ASSESSMENT_WEBSITE_URL", "https://deepiri.com")
+SECURITY_ASSESSMENT_EMAIL_DOMAIN = os.getenv("SECURITY_ASSESSMENT_EMAIL_DOMAIN", "deepiri.com")
+SECURITY_ASSESSMENT_DIGEST_WEEKDAYS = {0, 3}  # Monday and Thursday -- twice a week
+SECURITY_ASSESSMENT_DM_WEEKDAY = 0  # Monday -- once a week
+SECURITY_ASSESSMENT_RUN_HOUR_UTC = 9
+SECURITY_ASSESSMENT_LOOP_INTERVAL_SECONDS = 60 * 60  # check hourly whether it's time to fire
 
 
 def _pr_stale_dm_cadence_days(age_days: float) -> float:
@@ -851,23 +865,41 @@ async def _resolve_discord_member_for_github_login(login: str, guild: discord.Gu
     return None
 
 
-async def _resolve_pr_qa_reviewers(pr: dict, guild: discord.Guild) -> list:
-    """Requested reviewers on the PR who hold the QA Discord role, resolved via
-    the same GitHub->Discord identity chain used for the author. Returns a list
-    of (github_login, discord.Member) pairs -- only those that both resolve to
-    a Discord member AND hold QA_ROLE_ID count as "assigned QA" for staleness
-    purposes."""
+async def _resolve_pr_qa_reviewers(pr: dict, guild: discord.Guild) -> tuple:
+    """Requested reviewers on the PR, resolved via the same GitHub->Discord
+    identity chain used for the author (name fuzzy match, then Plaky email --
+    no hardcoded username mapping). Returns (raw_logins, identity_map, qa_role_pairs):
+
+    `raw_logins` is every requested-reviewer login exactly as GitHub reports
+    it -- the ground truth for whether a PR has "Assigned QA" at all, so the
+    staleness channel post never disagrees with what GitHub itself shows.
+
+    `identity_map` is {login: discord.Member} for every login the identity
+    chain actually resolved, regardless of Discord role -- used for display,
+    so the channel post mentions a real person whenever we know who they are.
+    A login missing from this map (chain found no match) falls back to the
+    bare GitHub username in the post, never a hardcoded guess.
+
+    `qa_role_pairs` is the subset of identity_map entries whose member also
+    holds QA_ROLE_ID -- only that subset can be DMed as a QA reviewer nudge,
+    since a stale/missing Discord role sync doesn't change who GitHub
+    considers the assigned reviewer, only who we're able to notify in Discord.
+    """
     full_pr = await asyncio.to_thread(get_pull_request, pr["repo"], pr["number"], GITHUB_PAT)
     if not full_pr:
-        return []
+        return [], {}, []
     requested = full_pr.get("requested_reviewers") or []
     logins = [r.get("login") for r in requested if r.get("login")]
-    resolved = []
+    identity_map: Dict[str, discord.Member] = {}
+    qa_role_pairs = []
     for login in logins:
         member = await _resolve_discord_member_for_github_login(login, guild)
-        if member is not None and member.get_role(QA_ROLE_ID) is not None:
-            resolved.append((login, member))
-    return resolved
+        if member is None:
+            continue
+        identity_map[login] = member
+        if member.get_role(QA_ROLE_ID) is not None:
+            qa_role_pairs.append((login, member))
+    return logins, identity_map, qa_role_pairs
 
 
 async def _pr_already_reviewed_by(pr: dict, login: str) -> bool:
@@ -878,13 +910,16 @@ async def _pr_already_reviewed_by(pr: dict, login: str) -> bool:
     return any((r.get("user") or {}).get("login", "").strip().lower() == login_lower for r in reviews)
 
 
-async def _post_pr_staleness_qa_channel(pr: dict, qa_reviewers: list) -> None:
+async def _post_pr_staleness_qa_channel(pr: dict, raw_logins: list, identity_map: dict) -> None:
     repo, number, title, url = pr["repo"], pr["number"], pr["title"], pr["html_url"]
     channel = await _channel_from_id(PR_STALE_QA_CHANNEL_ID)
     if channel is None:
         return
-    if qa_reviewers:
-        assigned = ", ".join(member.mention for _login, member in qa_reviewers)
+    if raw_logins:
+        assigned = ", ".join(
+            identity_map[login].mention if login in identity_map else login
+            for login in raw_logins
+        )
         cta = "Let's get this merged when you can!"
     else:
         assigned = "No QA assigned"
@@ -1003,10 +1038,10 @@ async def _scan_stale_prs(guild: discord.Guild) -> None:
             if member is not None:
                 await save_pr_staleness(pr["repo"], pr["number"], resolved_discord_id=str(member.id))
 
-        qa_reviewers = await _resolve_pr_qa_reviewers(pr, guild)
+        raw_qa_logins, qa_identity_map, qa_reviewers = await _resolve_pr_qa_reviewers(pr, guild)
 
         if not state["notified_2week"]:
-            await _post_pr_staleness_qa_channel(pr, qa_reviewers)
+            await _post_pr_staleness_qa_channel(pr, raw_qa_logins, qa_identity_map)
             await save_pr_staleness(pr["repo"], pr["number"], notified_2week=True)
 
         if age_days >= PR_STALE_2_5WEEK_DAYS:
@@ -1044,6 +1079,111 @@ async def _pr_staleness_scan_loop() -> None:
         except Exception:
             logger.exception("PR staleness scan iteration failed")
         await asyncio.sleep(PR_STALE_SCAN_INTERVAL_SECONDS)
+
+
+async def _run_security_assessment(guild: discord.Guild) -> Dict[str, Dict[str, object]]:
+    return await asyncio.to_thread(
+        run_full_assessment,
+        github_org=GITHUB_ORG or "",
+        github_pat=GITHUB_PAT or "",
+        plaky_api_key=PLAKY_API_KEY or "",
+        guild=guild,
+        website_url=SECURITY_ASSESSMENT_WEBSITE_URL,
+        email_domain=SECURITY_ASSESSMENT_EMAIL_DOMAIN,
+    )
+
+
+async def _post_security_digest(results: Dict[str, Dict[str, object]]) -> None:
+    channel = await _channel_from_id(STAFF_CHANNEL_ID)
+    if channel is None:
+        logger.warning("Security assessment digest not posted: STAFF_CHANNEL_ID not resolved")
+        return
+    status = overall_status(results)
+    color = {
+        "critical": discord.Color.red(),
+        "warning": discord.Color.orange(),
+        "ok": discord.Color.green(),
+    }.get(status, discord.Color.light_grey())
+    embed = discord.Embed(
+        title="Routine security assessment",
+        description="\n".join(render_digest_lines(results)),
+        color=color,
+    )
+    embed.set_footer(text="Run /security-check for an in-depth report.")
+    role_mention = f"<@&{IT_OPERATIONS_SUPPORT_ROLE_ID}>" if status == "critical" and IT_OPERATIONS_SUPPORT_ROLE_ID is not None else None
+    try:
+        await channel.send(content=role_mention, embed=embed)
+    except Exception:
+        logger.exception("Failed to post security assessment digest")
+
+
+def _build_indepth_security_embed(title: str, results: Dict[str, Dict[str, object]]) -> discord.Embed:
+    status = overall_status(results)
+    color = {
+        "critical": discord.Color.red(),
+        "warning": discord.Color.orange(),
+        "ok": discord.Color.green(),
+    }.get(status, discord.Color.light_grey())
+    embed = discord.Embed(title=title, color=color)
+    for block in render_indepth_report(results):
+        heading, _, body = block.partition("\n")
+        embed.add_field(name=heading[:256], value=(body or "—")[:1024], inline=False)
+    return embed
+
+
+async def _dm_security_digest_to_it_team(results: Dict[str, Dict[str, object]], guild: discord.Guild) -> int:
+    """DMs every IT_OPERATIONS_SUPPORT_ROLE_ID member the full in-depth
+    results directly -- not just a one-line-per-category summary -- on a
+    weekly cadence, regardless of whether anyone ran /security-check. Manual
+    routine checks stay expected of the team; this guarantees everyone gets
+    the actual findings in their DMs every week rather than having to go
+    looking for them."""
+    if IT_OPERATIONS_SUPPORT_ROLE_ID is None:
+        return 0
+    role = guild.get_role(IT_OPERATIONS_SUPPORT_ROLE_ID)
+    if role is None:
+        return 0
+    embed = _build_indepth_security_embed("Weekly security assessment — full results", results)
+    sent = 0
+    for member in role.members:
+        if member.bot:
+            continue
+        try:
+            await member.send(embed=embed)
+            sent += 1
+        except Exception:
+            logger.warning("Could not DM weekly security digest to %s (%s)", member, member.id)
+    return sent
+
+
+_SECURITY_DIGEST_STATE_KEY = "norozo_security_digest_last_sent_date"
+_SECURITY_DM_STATE_KEY = "norozo_security_dm_last_sent_date"
+
+
+async def _security_assessment_loop() -> None:
+    """Hourly tick that fires the twice-weekly #it-notifications digest and
+    the weekly IT-team DM at most once per calendar day each, tracked via the
+    same durable key/value state store as the PR-staleness checkpoint so a
+    restart mid-day doesn't cause a duplicate post."""
+    while True:
+        try:
+            now = datetime.now(timezone.utc)
+            if now.hour == SECURITY_ASSESSMENT_RUN_HOUR_UTC:
+                today = now.date().isoformat()
+                guild = await _get_primary_guild()
+                if guild is not None:
+                    if now.weekday() in SECURITY_ASSESSMENT_DIGEST_WEEKDAYS and await load_state(_SECURITY_DIGEST_STATE_KEY) != today:
+                        results = await _run_security_assessment(guild)
+                        await _post_security_digest(results)
+                        await save_state(_SECURITY_DIGEST_STATE_KEY, today)
+
+                    if now.weekday() == SECURITY_ASSESSMENT_DM_WEEKDAY and await load_state(_SECURITY_DM_STATE_KEY) != today:
+                        results = await _run_security_assessment(guild)
+                        await _dm_security_digest_to_it_team(results, guild)
+                        await save_state(_SECURITY_DM_STATE_KEY, today)
+        except Exception:
+            logger.exception("Security assessment loop iteration failed")
+        await asyncio.sleep(SECURITY_ASSESSMENT_LOOP_INTERVAL_SECONDS)
 
 
 async def _forward_announcement_to_platform(message: discord.Message) -> None:
@@ -2385,6 +2525,20 @@ def _register_slash_commands(target_bot: DeepiriBot) -> None:
         await qa_channel.send("\n".join(lines))
         await interaction.response.send_message("Posted status to QA channel.", ephemeral=True)
 
+    @target_bot.tree.command(name="security-check", description="Run an in-depth security assessment now (staff/IT only)")
+    async def security_check(interaction: discord.Interaction) -> None:
+        if not interaction.guild or not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message("This command must be used in a server.", ephemeral=True)
+            return
+        if not _is_staff_or_security_ops(interaction.user):
+            await interaction.response.send_message("This command is restricted to staff/IT.", ephemeral=True)
+            return
+
+        await interaction.response.defer(thinking=True, ephemeral=True)
+        results = await _run_security_assessment(interaction.guild)
+        embed = _build_indepth_security_embed("In-depth security assessment", results)
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
     @target_bot.tree.command(name="poll", description="Create a poll (staff only)")
     @app_commands.describe(question="The poll question", options="Comma-separated options (e.g., Yes, No, Maybe)")
     async def poll(interaction: discord.Interaction, question: str, options: str) -> None:
@@ -2880,6 +3034,7 @@ def _create_and_register_bot() -> DeepiriBot:
         asyncio.create_task(_catch_up_since_last_online(new_bot))
         asyncio.create_task(_heartbeat_last_online())
         asyncio.create_task(_pr_staleness_scan_loop())
+        asyncio.create_task(_security_assessment_loop())
 
     @new_bot.event  # type: ignore[attr-defined]
     async def on_member_join(member: discord.Member) -> None:  # type: ignore[no-redef]
